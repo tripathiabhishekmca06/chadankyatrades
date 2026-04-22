@@ -1425,6 +1425,36 @@ def inject_css() -> None:
             font-weight: 800;
             margin-top: 14px;
         }
+        @media (max-width: 768px) {
+            .block-container {
+                padding-top: 0.75rem;
+                padding-left: 0.75rem;
+                padding-right: 0.75rem;
+                padding-bottom: 1.5rem;
+            }
+            [data-testid="stHorizontalBlock"] {
+                flex-direction: column !important;
+                gap: 0.5rem !important;
+            }
+            [data-testid="stHorizontalBlock"] > div {
+                width: 100% !important;
+                flex: 1 1 100% !important;
+            }
+            .trade-card {
+                min-height: auto;
+                padding: 12px;
+            }
+            .card-stock {
+                font-size: 1.1rem;
+            }
+            .card-type {
+                font-size: 0.72rem;
+            }
+            .card-line,
+            .card-score {
+                font-size: 0.85rem;
+            }
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1436,28 +1466,31 @@ def render_trade_cards(data: pd.DataFrame, side: str) -> None:
         st.info("No long setups today" if side == "LONG" else "No short setups today")
         return
 
-    columns = st.columns(min(len(data), 5))
-    for column, (_, row) in zip(columns, data.iterrows()):
-        direction = signal_direction(str(row["Signal"]))
-        card_class = "long-card" if direction == "LONG" else "short-card"
-        if str(row["Signal Type"]).startswith("PULLBACK"):
-            card_class = f"{card_class} pullback-card"
+    cards_per_row = min(3, len(data))
+    for start in range(0, len(data), cards_per_row):
+        chunk = data.iloc[start : start + cards_per_row]
+        columns = st.columns(len(chunk))
+        for column, (_, row) in zip(columns, chunk.iterrows()):
+            direction = signal_direction(str(row["Signal"]))
+            card_class = "long-card" if direction == "LONG" else "short-card"
+            if str(row["Signal Type"]).startswith("PULLBACK"):
+                card_class = f"{card_class} pullback-card"
 
-        with column:
-            st.markdown(
-                f"""
-                <div class="trade-card {card_class}">
-                    <div class="card-signal">{direction}</div>
-                    <div class="card-stock">{row["Stock"]}</div>
-                    <div class="card-type">{signal_strength(str(row["Signal"]))} · {row["Signal Type"]}</div>
-                    <div class="card-line">Entry <strong>{row["Entry"]:,.2f}</strong></div>
-                    <div class="card-line">SL <strong>{row["Stop Loss"]:,.2f}</strong></div>
-                    <div class="card-line">Target <strong>{row["Target"]:,.2f}</strong></div>
-                    <div class="card-score">Score {int(row["Confidence Score"])}/5</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+            with column:
+                st.markdown(
+                    f"""
+                    <div class="trade-card {card_class}">
+                        <div class="card-signal">{direction}</div>
+                        <div class="card-stock">{row["Stock"]}</div>
+                        <div class="card-type">{signal_strength(str(row["Signal"]))} · {row["Signal Type"]}</div>
+                        <div class="card-line">Entry <strong>{row["Entry"]:,.2f}</strong></div>
+                        <div class="card-line">SL <strong>{row["Stop Loss"]:,.2f}</strong></div>
+                        <div class="card-line">Target <strong>{row["Target"]:,.2f}</strong></div>
+                        <div class="card-score">Score {int(row["Confidence Score"])}/5</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
 
 def render_trade_section(
@@ -1584,22 +1617,26 @@ def render_summary(signals: pd.DataFrame, last_updated: str) -> None:
     weak_count = int(signals["Signal"].isin(["WEAK_LONG", "WEAK_SHORT"]).sum()) if not signals.empty else 0
     wait_count = int((signals["Signal"] == "WAIT").sum()) if not signals.empty else 0
 
-    metric_columns = st.columns(5)
-    metric_columns[0].metric("Scanned", len(signals))
-    metric_columns[1].metric("Strong", strong_count)
-    metric_columns[2].metric("Watchlist", weak_count)
-    metric_columns[3].metric("WAIT", wait_count)
-    metric_columns[4].metric("Last updated", last_updated)
+    row_one = st.columns(3)
+    row_one[0].metric("Scanned", len(signals))
+    row_one[1].metric("Strong", strong_count)
+    row_one[2].metric("Watchlist", weak_count)
+
+    row_two = st.columns(2)
+    row_two[0].metric("WAIT", wait_count)
+    row_two[1].metric("Last updated", last_updated)
 
 
 def render_market_regime(regime: dict[str, str]) -> None:
     st.subheader("Market Regime")
-    columns = st.columns(5)
-    columns[0].metric("Market Type", regime["market_type"])
-    columns[1].metric("Direction", regime["direction"])
-    columns[2].metric("Strategy", regime["suggested_strategy"])
-    columns[3].metric("ADX", regime.get("adx", "-") or "-")
-    columns[4].metric("RSI", regime.get("rsi", "-") or "-")
+    row_one = st.columns(3)
+    row_one[0].metric("Market Type", regime["market_type"])
+    row_one[1].metric("Direction", regime["direction"])
+    row_one[2].metric("Strategy", regime["suggested_strategy"])
+
+    row_two = st.columns(2)
+    row_two[0].metric("ADX", regime.get("adx", "-") or "-")
+    row_two[1].metric("RSI", regime.get("rsi", "-") or "-")
     if regime.get("error"):
         st.warning(f"Market regime unavailable: {regime['error']}")
 
@@ -1622,7 +1659,7 @@ def render_scan_status(signals: pd.DataFrame, errors: list[str]) -> None:
 
 def main() -> None:
     configure_runtime_environment()
-    st.set_page_config(page_title="Futures Trading Dashboard", layout="wide")
+    st.set_page_config(page_title="Futures Trading Dashboard", layout="wide", initial_sidebar_state="collapsed")
     inject_css()
 
     fno_symbols, fno_error = load_stock_list()
