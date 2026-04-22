@@ -26,6 +26,7 @@ FUTURES_COLUMNS = [
     "Stock",
     "Signal",
     "Signal Type",
+    "Structure Signal",
     "Entry",
     "Current Price",
     "EMA20",
@@ -35,6 +36,9 @@ FUTURES_COLUMNS = [
     "ATR",
     "Volume",
     "Avg Volume",
+    "Volume Strength",
+    "Market Structure",
+    "Structure Break",
     "Distance from EMA20 %",
     "Confidence Score",
     "Exit Signal",
@@ -98,9 +102,11 @@ SIGNAL_TYPE_PRIORITY = {
 SIGNAL_PRIORITY = {
     "STRONG_LONG": 1,
     "STRONG_SHORT": 1,
-    "WEAK_LONG": 2,
-    "WEAK_SHORT": 2,
-    "WAIT": 3,
+    "EARLY_LONG": 2,
+    "EARLY_SHORT": 2,
+    "WEAK_LONG": 3,
+    "WEAK_SHORT": 3,
+    "WAIT": 4,
 }
 
 SYMBOL_COLUMN_CANDIDATES = (
@@ -168,6 +174,7 @@ class StrategyConfig:
     target_rr: float = 2.0
     option_sl_pct: float = 0.30
     option_target_pct: float = 0.60
+    swing_lookback: int = 2
 
     @property
     def minimum_rows(self) -> int:
@@ -393,10 +400,10 @@ def fetch_index_data(symbol: str = "^NSEI", period: str = "1y", interval: str = 
             threads=False,
         )
     except Exception as exc:
-        raise RuntimeError(f"NIFTY 50 request failed: {exc}") from exc
+        raise RuntimeError(f"Index request failed for {symbol}: {exc}") from exc
 
     if data.empty:
-        raise RuntimeError("No NIFTY 50 data returned from Yahoo Finance")
+        raise RuntimeError(f"No data returned from Yahoo Finance for {symbol}")
 
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
@@ -404,7 +411,7 @@ def fetch_index_data(symbol: str = "^NSEI", period: str = "1y", interval: str = 
     data = data.rename(columns=str.title)
     missing_columns = [column for column in OHLCV_COLUMNS if column not in data.columns]
     if missing_columns:
-        raise RuntimeError(f"NIFTY 50 data missing columns: {', '.join(missing_columns)}")
+        raise RuntimeError(f"Index data missing columns for {symbol}: {', '.join(missing_columns)}")
 
     data = data[OHLCV_COLUMNS].copy()
     for column in OHLCV_COLUMNS:
@@ -412,7 +419,7 @@ def fetch_index_data(symbol: str = "^NSEI", period: str = "1y", interval: str = 
 
     cleaned = data.dropna(subset=["Open", "High", "Low", "Close"])
     if cleaned.empty:
-        raise RuntimeError("NIFTY 50 response had no valid OHLC rows")
+        raise RuntimeError(f"Index response had no valid OHLC rows for {symbol}")
     return cleaned
 
 
@@ -530,39 +537,59 @@ def default_market_regime(error: str = "") -> dict[str, str]:
         "market_type": "UNKNOWN",
         "direction": "NEUTRAL",
         "suggested_strategy": "NO TRADE",
+        "trend_confirmation": "WEAK",
+        "nifty_trend": "UNKNOWN",
+        "banknifty_trend": "UNKNOWN",
         "adx": "",
         "rsi": "",
         "error": error,
     }
 
 
+def classify_index_trend(data: pd.DataFrame, config: StrategyConfig) -> tuple[str, float, float]:
+    enriched = add_regime_indicators(data, config).dropna()
+    if enriched.empty:
+        raise RuntimeError("Insufficient index indicator data")
+
+    latest = enriched.iloc[-1]
+    ema20 = float(latest["EMA20"])
+    ema50 = float(latest["EMA50"])
+    rsi = float(latest["RSI"])
+    adx = float(latest["ADX"])
+
+    bullish = ema20 > ema50 and adx > 20 and rsi > 55
+    bearish = ema20 < ema50 and adx > 20 and rsi < 45
+    sideways = adx < 20
+
+    if bullish:
+        trend = "BULLISH"
+    elif bearish:
+        trend = "BEARISH"
+    elif sideways:
+        trend = "SIDEWAYS"
+    else:
+        trend = "NEUTRAL"
+
+    return trend, adx, rsi
+
+
 def get_market_regime() -> dict[str, str]:
     try:
-        index_data = fetch_index_data()
         config = StrategyConfig()
-        data = add_regime_indicators(index_data, config).dropna()
-        if data.empty:
-            return default_market_regime("Insufficient NIFTY 50 indicator data")
+        nifty_data = fetch_index_data("^NSEI")
+        banknifty_data = fetch_index_data("^NSEBANK")
+        nifty_trend, adx, rsi = classify_index_trend(nifty_data, config)
+        banknifty_trend, _, _ = classify_index_trend(banknifty_data, config)
 
-        latest = data.iloc[-1]
-        ema20 = float(latest["EMA20"])
-        ema50 = float(latest["EMA50"])
-        rsi = float(latest["RSI"])
-        adx = float(latest["ADX"])
-
-        bullish = ema20 > ema50 and adx > 20 and rsi > 55
-        bearish = ema20 < ema50 and adx > 20 and rsi < 45
-        sideways = adx < 20
-
-        if bullish:
+        if nifty_trend == "BULLISH":
             market_type = "TRENDING_BULLISH"
             direction = "UP"
             suggested_strategy = "PULLBACK_LONG"
-        elif bearish:
+        elif nifty_trend == "BEARISH":
             market_type = "TRENDING_BEARISH"
             direction = "DOWN"
             suggested_strategy = "PULLBACK_SHORT"
-        elif sideways:
+        elif nifty_trend == "SIDEWAYS":
             market_type = "SIDEWAYS"
             direction = "NEUTRAL"
             suggested_strategy = "PULLBACK"
@@ -571,10 +598,18 @@ def get_market_regime() -> dict[str, str]:
             direction = "NEUTRAL"
             suggested_strategy = "NO TRADE"
 
+        if nifty_trend in {"BULLISH", "BEARISH"} and nifty_trend == banknifty_trend:
+            trend_confirmation = "STRONG"
+        else:
+            trend_confirmation = "WEAK"
+
         return {
             "market_type": market_type,
             "direction": direction,
             "suggested_strategy": suggested_strategy,
+            "trend_confirmation": trend_confirmation,
+            "nifty_trend": nifty_trend,
+            "banknifty_trend": banknifty_trend,
             "adx": f"{adx:.1f}",
             "rsi": f"{rsi:.1f}",
             "error": "",
@@ -595,11 +630,11 @@ def rejection_reason(long_conditions: dict[str, bool], short_conditions: dict[st
 
 
 def is_long_signal(signal: str) -> bool:
-    return signal in {"STRONG_LONG", "WEAK_LONG"}
+    return signal in {"STRONG_LONG", "WEAK_LONG", "EARLY_LONG"}
 
 
 def is_short_signal(signal: str) -> bool:
-    return signal in {"STRONG_SHORT", "WEAK_SHORT"}
+    return signal in {"STRONG_SHORT", "WEAK_SHORT", "EARLY_SHORT"}
 
 
 def is_trade_signal(signal: str) -> bool:
@@ -617,6 +652,8 @@ def signal_direction(signal: str) -> str:
 def signal_strength(signal: str) -> str:
     if signal.startswith("STRONG"):
         return "STRONG"
+    if signal.startswith("EARLY"):
+        return "EARLY"
     if signal.startswith("WEAK"):
         return "WEAK"
     return "WAIT"
@@ -692,6 +729,23 @@ def init_db(connection: sqlite3.Connection) -> None:
     )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_signals_active_stock ON signals(stock, status)"
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS performance_metrics (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            updated_at TEXT,
+            total_trades INTEGER,
+            wins INTEGER,
+            losses INTEGER,
+            win_rate REAL,
+            avg_profit REAL,
+            avg_loss REAL,
+            expectancy REAL,
+            profit_factor REAL,
+            total_pnl REAL
+        )
+        """
     )
     connection.commit()
 
@@ -801,6 +855,115 @@ def get_trade_history(connection: sqlite3.Connection, limit: int = 20) -> pd.Dat
         (limit,),
     ).fetchall()
     return rows_to_dataframe(rows)
+
+
+def default_performance_metrics() -> dict[str, float | int | str]:
+    return {
+        "updated_at": "",
+        "total_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate": 0.0,
+        "avg_profit": 0.0,
+        "avg_loss": 0.0,
+        "expectancy": 0.0,
+        "profit_factor": 0.0,
+        "total_pnl": 0.0,
+    }
+
+
+def calculate_performance_metrics(connection: sqlite3.Connection) -> dict[str, float | int | str]:
+    row = connection.execute(
+        """
+        SELECT
+            COUNT(*) AS total_trades,
+            COALESCE(SUM(CASE WHEN pnl_percent > 0 THEN 1 ELSE 0 END), 0) AS wins,
+            COALESCE(SUM(CASE WHEN pnl_percent < 0 THEN 1 ELSE 0 END), 0) AS losses,
+            AVG(CASE WHEN pnl_percent > 0 THEN pnl_percent END) AS avg_profit,
+            AVG(CASE WHEN pnl_percent < 0 THEN pnl_percent END) AS avg_loss,
+            COALESCE(SUM(CASE WHEN pnl_percent > 0 THEN pnl_percent ELSE 0 END), 0) AS gross_profit,
+            COALESCE(SUM(CASE WHEN pnl_percent < 0 THEN pnl_percent ELSE 0 END), 0) AS gross_loss,
+            COALESCE(SUM(COALESCE(pnl_percent, 0)), 0) AS total_pnl
+        FROM signals
+        WHERE status = 'CLOSED'
+          AND pnl_percent IS NOT NULL
+        """
+    ).fetchone()
+
+    if row is None:
+        return default_performance_metrics()
+
+    total_trades = int(row["total_trades"] or 0)
+    wins = int(row["wins"] or 0)
+    losses = int(row["losses"] or 0)
+    avg_profit = float(row["avg_profit"] or 0.0)
+    avg_loss = float(row["avg_loss"] or 0.0)
+    gross_profit = float(row["gross_profit"] or 0.0)
+    gross_loss = float(row["gross_loss"] or 0.0)
+    total_pnl = float(row["total_pnl"] or 0.0)
+    win_rate = (wins / total_trades * 100) if total_trades else 0.0
+    expectancy = (total_pnl / total_trades) if total_trades else 0.0
+
+    if gross_loss < 0:
+        profit_factor = gross_profit / abs(gross_loss)
+    elif gross_profit > 0:
+        profit_factor = np.inf
+    else:
+        profit_factor = 0.0
+
+    return {
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "total_trades": total_trades,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "avg_profit": avg_profit,
+        "avg_loss": avg_loss,
+        "expectancy": expectancy,
+        "profit_factor": profit_factor,
+        "total_pnl": total_pnl,
+    }
+
+
+def store_performance_metrics(connection: sqlite3.Connection, metrics: dict[str, float | int | str]) -> None:
+    connection.execute(
+        """
+        INSERT INTO performance_metrics (
+            id, updated_at, total_trades, wins, losses, win_rate, avg_profit, avg_loss,
+            expectancy, profit_factor, total_pnl
+        )
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            updated_at = excluded.updated_at,
+            total_trades = excluded.total_trades,
+            wins = excluded.wins,
+            losses = excluded.losses,
+            win_rate = excluded.win_rate,
+            avg_profit = excluded.avg_profit,
+            avg_loss = excluded.avg_loss,
+            expectancy = excluded.expectancy,
+            profit_factor = excluded.profit_factor,
+            total_pnl = excluded.total_pnl
+        """,
+        (
+            str(metrics["updated_at"]),
+            int(metrics["total_trades"]),
+            int(metrics["wins"]),
+            int(metrics["losses"]),
+            float(metrics["win_rate"]),
+            float(metrics["avg_profit"]),
+            float(metrics["avg_loss"]),
+            float(metrics["expectancy"]),
+            float(metrics["profit_factor"]),
+            float(metrics["total_pnl"]),
+        ),
+    )
+
+
+def refresh_performance_metrics(connection: sqlite3.Connection) -> dict[str, float | int | str]:
+    metrics = calculate_performance_metrics(connection)
+    store_performance_metrics(connection, metrics)
+    return metrics
 
 
 def update_signals(connection: sqlite3.Connection, signals: pd.DataFrame, timestamp: str) -> None:
@@ -933,6 +1096,88 @@ def classify_setup(
     return "", np.nan
 
 
+def detect_swings(data: pd.DataFrame, lookback: int = 2) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
+    highs = data["High"].astype(float).to_numpy()
+    lows = data["Low"].astype(float).to_numpy()
+    swing_highs: list[tuple[int, float]] = []
+    swing_lows: list[tuple[int, float]] = []
+
+    for idx in range(lookback, len(data) - lookback):
+        high_window = highs[idx - lookback : idx + lookback + 1]
+        low_window = lows[idx - lookback : idx + lookback + 1]
+        high_value = highs[idx]
+        low_value = lows[idx]
+
+        if np.isfinite(high_value) and high_value == np.max(high_window):
+            if np.sum(high_window == high_value) == 1:
+                swing_highs.append((idx, float(high_value)))
+        if np.isfinite(low_value) and low_value == np.min(low_window):
+            if np.sum(low_window == low_value) == 1:
+                swing_lows.append((idx, float(low_value)))
+
+    return swing_highs, swing_lows
+
+
+def structure_state(
+    data: pd.DataFrame,
+    latest: pd.Series,
+    avg_volume: float,
+    config: StrategyConfig,
+) -> dict[str, Any]:
+    swings_high, swings_low = detect_swings(data, lookback=config.swing_lookback)
+    last_close = float(latest["Close"])
+    last_volume = float(latest["Volume"])
+    volume_strength_ratio = (last_volume / avg_volume) if avg_volume and avg_volume > 0 else 0.0
+    volume_confirmed = volume_strength_ratio >= 1.5
+
+    high_tag = ""
+    low_tag = ""
+    if len(swings_high) >= 2:
+        high_tag = "HH" if swings_high[-1][1] > swings_high[-2][1] else "LH"
+    if len(swings_low) >= 2:
+        low_tag = "HL" if swings_low[-1][1] > swings_low[-2][1] else "LL"
+
+    if high_tag and low_tag:
+        market_structure = f"{high_tag}/{low_tag}"
+    else:
+        market_structure = high_tag or low_tag or "UNKNOWN"
+
+    previous_swing_high = swings_high[-1][1] if swings_high else np.nan
+    previous_swing_low = swings_low[-1][1] if swings_low else np.nan
+    bullish_break = bool(not np.isnan(previous_swing_high) and last_close > previous_swing_high)
+    bearish_break = bool(not np.isnan(previous_swing_low) and last_close < previous_swing_low)
+    structure_break = bullish_break or bearish_break
+    bullish_structure = high_tag == "HH" and low_tag == "HL"
+    bearish_structure = high_tag == "LH" and low_tag == "LL"
+
+    structure_signal = ""
+    structure_direction = "WAIT"
+    if structure_break and volume_confirmed:
+        structure_signal = "STRUCTURE_BREAK"
+        structure_direction = "LONG" if bullish_break else "SHORT"
+    elif bullish_structure and volume_confirmed:
+        structure_signal = "STRUCTURE_BULLISH"
+        structure_direction = "LONG"
+    elif bearish_structure and volume_confirmed:
+        structure_signal = "STRUCTURE_BEARISH"
+        structure_direction = "SHORT"
+    elif bullish_structure:
+        structure_direction = "LONG"
+    elif bearish_structure:
+        structure_direction = "SHORT"
+
+    return {
+        "structure_signal": structure_signal,
+        "structure_direction": structure_direction,
+        "market_structure": market_structure,
+        "structure_break": structure_break,
+        "volume_strength_ratio": volume_strength_ratio,
+        "volume_confirmed": volume_confirmed,
+        "bullish_break": bullish_break,
+        "bearish_break": bearish_break,
+    }
+
+
 def confidence_score(
     signal: str,
     rsi: float,
@@ -1021,6 +1266,34 @@ def evaluate_symbol(
     else:
         signal = "WAIT"
 
+    structure = structure_state(
+        data=data,
+        latest=latest,
+        avg_volume=avg_volume,
+        config=config,
+    )
+    structure_signal = str(structure["structure_signal"])
+    structure_direction = str(structure["structure_direction"])
+    structure_break = bool(structure["structure_break"])
+    volume_confirmed = bool(structure["volume_confirmed"])
+
+    # Dow-theory structure acts as an additional overlay.
+    # EMA + structure agreement upgrades confidence; structure-led breaks can surface early signals.
+    if signal_direction(signal) == structure_direction and is_trade_signal(signal) and structure_signal:
+        signal = "STRONG_LONG" if structure_direction == "LONG" else "STRONG_SHORT"
+    elif structure_break and volume_confirmed and structure_direction == "LONG" and signal_direction(signal) != "LONG":
+        signal = "EARLY_LONG"
+        if np.isnan(entry):
+            entry = close
+        if not signal_type:
+            signal_type = "STRUCTURE_BREAK"
+    elif structure_break and volume_confirmed and structure_direction == "SHORT" and signal_direction(signal) != "SHORT":
+        signal = "EARLY_SHORT"
+        if np.isnan(entry):
+            entry = close
+        if not signal_type:
+            signal_type = "STRUCTURE_BREAK"
+
     stop_loss, target = build_trade_plan(signal, entry, atr_value, config)
     score = confidence_score(
         signal=signal,
@@ -1045,6 +1318,8 @@ def evaluate_symbol(
             reason = "No trade: setup not ready"
     elif signal.startswith("STRONG"):
         reason = f"Accepted: {signal_type} swing setup"
+    elif signal.startswith("EARLY"):
+        reason = "Accepted early: Dow structure break with volume confirmation"
     else:
         reason = f"Watchlist: trend aligned, waiting for pullback or breakout trigger"
 
@@ -1058,6 +1333,7 @@ def evaluate_symbol(
         "Stock": symbol,
         "Signal": signal,
         "Signal Type": signal_type,
+        "Structure Signal": structure_signal,
         "Entry": entry,
         "Current Price": close,
         "EMA20": ema20,
@@ -1067,6 +1343,9 @@ def evaluate_symbol(
         "ATR": atr_value,
         "Volume": volume,
         "Avg Volume": avg_volume,
+        "Volume Strength": float(structure["volume_strength_ratio"]),
+        "Market Structure": str(structure["market_structure"]),
+        "Structure Break": "Yes" if structure_break else "No",
         "Distance from EMA20 %": distance_from_ema20 * 100,
         "Confidence Score": score,
         "Exit Signal": exit_signal,
@@ -1323,6 +1602,7 @@ def format_futures_table(data: pd.DataFrame):
             "ATR": "{:,.2f}",
             "Volume": "{:,.0f}",
             "Avg Volume": "{:,.0f}",
+            "Volume Strength": "{:,.2f}x",
             "Distance from EMA20 %": "{:,.2f}",
             "Confidence Score": "{:.0f}",
         },
@@ -1343,6 +1623,21 @@ def format_options_table(data: pd.DataFrame):
 
 
 def format_active_table(data: pd.DataFrame):
+    def pnl_style(row: pd.Series) -> list[str]:
+        styles = [""] * len(row.index)
+        pnl_value = pd.to_numeric(row.get("P&L %"), errors="coerce")
+        if pd.isna(pnl_value):
+            return styles
+        try:
+            pnl_idx = list(row.index).index("P&L %")
+        except ValueError:
+            return styles
+        if pnl_value > 0:
+            styles[pnl_idx] = "color: #16803c; font-weight: 700;"
+        elif pnl_value < 0:
+            styles[pnl_idx] = "color: #c62828; font-weight: 700;"
+        return styles
+
     return data.style.format(
         {
             "Entry": "{:,.2f}",
@@ -1353,7 +1648,7 @@ def format_active_table(data: pd.DataFrame):
             "Confidence": "{:.0f}",
         },
         na_rep="-",
-    )
+    ).apply(pnl_style, axis=1)
 
 
 def format_closed_table(data: pd.DataFrame):
@@ -1372,58 +1667,87 @@ def inject_css() -> None:
         """
         <style>
         .block-container {
-            padding-top: 1.5rem;
+            padding-top: 0.6rem;
+            padding-bottom: 1.1rem;
         }
-        .trade-card {
-            border: 1px solid rgba(0, 0, 0, 0.08);
+        h2, h3 {
+            margin-top: 0.35rem !important;
+            margin-bottom: 0.4rem !important;
+            font-size: 1.05rem !important;
+        }
+        div[data-testid="metric-container"] {
+            padding: 0.4rem 0.55rem;
+            border: 1px solid rgba(120, 120, 120, 0.22);
             border-radius: 8px;
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
-            margin-bottom: 12px;
-            min-height: 190px;
-            padding: 16px;
+        }
+        div[data-testid="metric-container"] label {
+            font-size: 0.72rem !important;
+        }
+        div[data-testid="metric-container"] [data-testid="stMetricValue"] {
+            font-size: 1rem !important;
+        }
+        div[data-testid="stVerticalBlock"] > div {
+            gap: 0.45rem;
+        }
+        .compact-card {
+            border: 1px solid rgba(0, 0, 0, 0.1);
+            border-radius: 8px;
+            margin-bottom: 8px;
+            padding: 8px 10px;
         }
         .long-card {
-            background: #e8f7ed;
-            border-left: 6px solid #16803c;
-            color: #102f1b;
+            background: #edf9f0;
+            border-left: 4px solid #16803c;
+            color: #12311d;
         }
         .short-card {
-            background: #ffe9e9;
-            border-left: 6px solid #c62828;
+            background: #ffefef;
+            border-left: 4px solid #c62828;
             color: #421111;
         }
-        .pullback-card {
-            border-top: 4px solid #d8a600;
-            box-shadow: 0 10px 30px rgba(145, 110, 0, 0.18);
-        }
-        .card-signal {
-            font-size: 0.85rem;
-            font-weight: 800;
-            letter-spacing: 0;
-            margin-bottom: 4px;
-        }
         .card-stock {
-            font-size: 1.35rem;
+            font-size: 0.95rem;
             font-weight: 800;
-            margin-bottom: 6px;
-        }
-        .card-type {
-            background: rgba(255, 255, 255, 0.65);
-            border-radius: 8px;
-            display: inline-block;
-            font-size: 0.78rem;
-            font-weight: 800;
-            margin-bottom: 10px;
-            padding: 3px 8px;
+            margin-bottom: 5px;
         }
         .card-line {
-            font-size: 0.92rem;
-            margin: 6px 0;
+            font-size: 0.78rem;
+            margin: 2px 0;
         }
         .card-score {
-            font-size: 0.9rem;
+            font-size: 0.76rem;
+            font-weight: 700;
+            margin-top: 3px;
+        }
+        .top-trade-highlight {
+            border-radius: 12px;
+            margin-bottom: 8px;
+            padding: 14px 16px;
+            background: linear-gradient(135deg, #0b2f1a 0%, #1e8f46 100%);
+            color: #ffffff;
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            box-shadow: 0 10px 24px rgba(8, 39, 21, 0.26);
+        }
+        .top-trade-highlight.short {
+            background: linear-gradient(135deg, #441313 0%, #c62828 100%);
+            box-shadow: 0 10px 24px rgba(66, 17, 17, 0.25);
+        }
+        .top-trade-title {
+            font-size: 0.8rem;
+            font-weight: 700;
+            letter-spacing: 0.02em;
+            margin-bottom: 6px;
+            opacity: 0.95;
+        }
+        .top-trade-stock {
+            font-size: 1.35rem;
             font-weight: 800;
-            margin-top: 14px;
+            margin-bottom: 8px;
+            line-height: 1.2;
+        }
+        .top-trade-line {
+            font-size: 0.9rem;
+            margin: 2px 0;
         }
         @media (max-width: 768px) {
             .block-container {
@@ -1440,19 +1764,21 @@ def inject_css() -> None:
                 width: 100% !important;
                 flex: 1 1 100% !important;
             }
-            .trade-card {
-                min-height: auto;
-                padding: 12px;
-            }
             .card-stock {
-                font-size: 1.1rem;
-            }
-            .card-type {
-                font-size: 0.72rem;
+                font-size: 0.9rem;
             }
             .card-line,
             .card-score {
-                font-size: 0.85rem;
+                font-size: 0.76rem;
+            }
+            .top-trade-highlight {
+                padding: 11px 12px;
+            }
+            .top-trade-stock {
+                font-size: 1.05rem;
+            }
+            .top-trade-line {
+                font-size: 0.8rem;
             }
         }
         </style>
@@ -1466,27 +1792,23 @@ def render_trade_cards(data: pd.DataFrame, side: str) -> None:
         st.info("No long setups today" if side == "LONG" else "No short setups today")
         return
 
-    cards_per_row = min(3, len(data))
+    cards_per_row = min(4, len(data))
     for start in range(0, len(data), cards_per_row):
         chunk = data.iloc[start : start + cards_per_row]
         columns = st.columns(len(chunk))
         for column, (_, row) in zip(columns, chunk.iterrows()):
             direction = signal_direction(str(row["Signal"]))
             card_class = "long-card" if direction == "LONG" else "short-card"
-            if str(row["Signal Type"]).startswith("PULLBACK"):
-                card_class = f"{card_class} pullback-card"
 
             with column:
                 st.markdown(
                     f"""
-                    <div class="trade-card {card_class}">
-                        <div class="card-signal">{direction}</div>
-                        <div class="card-stock">{row["Stock"]}</div>
-                        <div class="card-type">{signal_strength(str(row["Signal"]))} · {row["Signal Type"]}</div>
+                    <div class="compact-card {card_class}">
+                        <div class="card-stock">{"🟢" if direction == "LONG" else "🔴"} {row["Stock"]}</div>
                         <div class="card-line">Entry <strong>{row["Entry"]:,.2f}</strong></div>
                         <div class="card-line">SL <strong>{row["Stop Loss"]:,.2f}</strong></div>
                         <div class="card-line">Target <strong>{row["Target"]:,.2f}</strong></div>
-                        <div class="card-score">Score {int(row["Confidence Score"])}/5</div>
+                        <div class="card-score">Conf {int(row["Confidence Score"])}/5 · {signal_strength(str(row["Signal"]))}</div>
                     </div>
                     """,
                     unsafe_allow_html=True,
@@ -1499,54 +1821,69 @@ def render_trade_section(
     option_trades: pd.DataFrame,
     side: str,
 ) -> None:
-    side_signals = {"LONG": {"STRONG_LONG", "WEAK_LONG"}, "SHORT": {"STRONG_SHORT", "WEAK_SHORT"}}
+    side_signals = {
+        "LONG": {"STRONG_LONG", "EARLY_LONG", "WEAK_LONG"},
+        "SHORT": {"STRONG_SHORT", "EARLY_SHORT", "WEAK_SHORT"},
+    }
     allowed = side_signals.get(side.upper(), set())
     futures_trades = futures_trades[futures_trades["Signal"].isin(allowed)].copy() if allowed and not futures_trades.empty else futures_trades
     option_trades = option_trades[
         option_trades["Option Type"].isin(["CE"] if side.upper() == "LONG" else ["PE"])
     ].copy() if not option_trades.empty and side.upper() in {"LONG", "SHORT"} else option_trades
 
-    st.subheader(title)
-    render_trade_cards(futures_trades, side)
+    trade_count = len(futures_trades)
+    preview_count = 3
+    show_all_key = f"show_{side.lower()}_all"
+    show_all = bool(st.session_state.get(show_all_key, False))
+    visible_trades = futures_trades if show_all else futures_trades.head(preview_count)
 
-    futures_column, options_column = st.columns(2)
-    with futures_column:
-        st.markdown("**Futures**")
-        st.dataframe(format_futures_table(futures_trades), use_container_width=True, hide_index=True)
+    with st.expander(f"{title} ({trade_count})", expanded=False):
+        if visible_trades.empty:
+            st.info("No trades available in this section.")
+            return
 
-    with options_column:
-        st.markdown("**Options**")
-        if option_trades.empty:
-            st.info("No option-tradable symbols for these futures trades.")
-        else:
-            st.dataframe(format_options_table(option_trades), use_container_width=True, hide_index=True)
+        render_trade_cards(visible_trades, side)
+
+        if trade_count > preview_count and not show_all:
+            if st.button("Show More", key=f"{show_all_key}_btn"):
+                st.session_state[show_all_key] = True
+                st.rerun()
+        elif trade_count > preview_count and show_all:
+            if st.button("Show Less", key=f"{show_all_key}_less_btn"):
+                st.session_state[show_all_key] = False
+                st.rerun()
+
+        with st.expander("Details", expanded=False):
+            st.dataframe(format_futures_table(visible_trades), use_container_width=True, hide_index=True)
+            if not option_trades.empty:
+                st.dataframe(format_options_table(option_trades), use_container_width=True, hide_index=True)
 
 
 def render_active_trades(active_history: pd.DataFrame, signals: pd.DataFrame) -> None:
-    st.subheader("🟢 ACTIVE TRADES")
-    active = active_trades_table(active_history, signals)
-    if active.empty:
-        st.info("No active trades.")
-    else:
-        st.dataframe(format_active_table(active), use_container_width=True, hide_index=True)
+    with st.expander("📊 Active Trades", expanded=False):
+        active = active_trades_table(active_history, signals)
+        if active.empty:
+            st.info("No active trades.")
+        else:
+            st.dataframe(format_active_table(active), use_container_width=True, hide_index=True)
 
 
 def render_closed_trades(closed_history: pd.DataFrame) -> None:
-    st.subheader("📜 TRADE HISTORY")
-    closed = closed_trades_table(closed_history)
-    if closed.empty:
-        st.info("No closed trades yet.")
-    else:
-        st.dataframe(format_closed_table(closed), use_container_width=True, hide_index=True)
+    with st.expander("📜 Trade History", expanded=False):
+        closed = closed_trades_table(closed_history)
+        if closed.empty:
+            st.info("No closed trades yet.")
+        else:
+            st.dataframe(format_closed_table(closed), use_container_width=True, hide_index=True)
 
 
 def render_exit_signals(closed_history: pd.DataFrame) -> None:
-    st.subheader("🚨 EXIT SIGNALS")
-    closed = closed_trades_table(closed_history)
-    if closed.empty:
-        st.info("No exit signals.")
-    else:
-        st.dataframe(format_closed_table(closed), use_container_width=True, hide_index=True)
+    with st.expander("🚨 Exit Signals", expanded=False):
+        closed = closed_trades_table(closed_history)
+        if closed.empty:
+            st.info("No exit signals.")
+        else:
+            st.dataframe(format_closed_table(closed), use_container_width=True, hide_index=True)
 
 
 def render_sidebar(fno_symbols: list[str], option_symbols: list[str]) -> tuple[list[str], StrategyConfig, str, str, bool]:
@@ -1627,18 +1964,88 @@ def render_summary(signals: pd.DataFrame, last_updated: str) -> None:
     row_two[1].metric("Last updated", last_updated)
 
 
-def render_market_regime(regime: dict[str, str]) -> None:
-    st.subheader("Market Regime")
+def render_performance_dashboard(metrics: dict[str, float | int | str]) -> None:
+    with st.expander("📈 Trade Performance", expanded=False):
+        win_rate = float(metrics.get("win_rate", 0.0))
+        profit_factor = float(metrics.get("profit_factor", 0.0))
+        total_pnl = float(metrics.get("total_pnl", 0.0))
+        total_trades = int(metrics.get("total_trades", 0))
+        avg_profit = float(metrics.get("avg_profit", 0.0))
+        avg_loss = float(metrics.get("avg_loss", 0.0))
+        expectancy = float(metrics.get("expectancy", 0.0))
+
+        display_profit_factor = "∞" if np.isinf(profit_factor) else f"{profit_factor:.2f}"
+
+        summary_columns = st.columns(3)
+        summary_columns[0].metric("Win %", f"{win_rate:.1f}%")
+        summary_columns[1].metric("Profit factor", display_profit_factor)
+        summary_columns[2].metric("Total P&L %", f"{total_pnl:.2f}")
+
+        detail_columns = st.columns(3)
+        detail_columns[0].metric("Total trades", total_trades)
+        detail_columns[1].metric("Avg profit/loss %", f"{avg_profit:.2f} / {avg_loss:.2f}")
+        detail_columns[2].metric("Expectancy %", f"{expectancy:.2f}")
+
+
+def render_market_regime(regime: dict[str, str], signals: pd.DataFrame, last_updated: str) -> None:
+    strong_count = int(signals["Signal"].isin(["STRONG_LONG", "STRONG_SHORT"]).sum()) if not signals.empty else 0
+    watchlist_count = int(
+        signals["Signal"].isin(["WEAK_LONG", "WEAK_SHORT", "EARLY_LONG", "EARLY_SHORT"]).sum()
+    ) if not signals.empty else 0
+
+    st.subheader("📌 Market Regime")
     row_one = st.columns(3)
     row_one[0].metric("Market Type", regime["market_type"])
     row_one[1].metric("Direction", regime["direction"])
     row_one[2].metric("Strategy", regime["suggested_strategy"])
 
-    row_two = st.columns(2)
+    row_two = st.columns(3)
     row_two[0].metric("ADX", regime.get("adx", "-") or "-")
     row_two[1].metric("RSI", regime.get("rsi", "-") or "-")
+    row_two[2].metric("Last updated", last_updated)
+
+    row_three = st.columns(3)
+    row_three[0].metric("Scanned", len(signals))
+    row_three[1].metric("Strong", strong_count)
+    row_three[2].metric("Watchlist", watchlist_count)
+
     if regime.get("error"):
         st.warning(f"Market regime unavailable: {regime['error']}")
+
+
+def render_top_trade_highlight(signals: pd.DataFrame) -> None:
+    trade_signals = {"STRONG_LONG", "EARLY_LONG", "WEAK_LONG", "STRONG_SHORT", "EARLY_SHORT", "WEAK_SHORT"}
+    if signals.empty or "Signal" not in signals.columns:
+        return
+
+    candidates = signals[signals["Signal"].isin(trade_signals)].copy()
+    if candidates.empty:
+        st.info("Top Trade Highlight: no actionable trade signal right now.")
+        return
+
+    candidates["_priority"] = candidates["Signal"].map(SIGNAL_PRIORITY).fillna(99)
+    candidates = candidates.sort_values(
+        by=["Confidence Score", "_priority", "Distance from EMA20 %"],
+        ascending=[False, True, True],
+    )
+    top = candidates.iloc[0]
+    direction = signal_direction(str(top["Signal"]))
+    direction_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
+    card_class = "" if direction == "LONG" else "short"
+    score = int(pd.to_numeric(top.get("Confidence Score"), errors="coerce") or 0)
+
+    st.markdown(
+        f"""
+        <div class="top-trade-highlight {card_class}">
+            <div class="top-trade-title">⭐ TOP TRADE HIGHLIGHT · Score {score}/5 · {direction_emoji}</div>
+            <div class="top-trade-stock">{top["Stock"]}</div>
+            <div class="top-trade-line">Entry: <strong>{float(top["Entry"]):,.2f}</strong></div>
+            <div class="top-trade-line">SL: <strong>{float(top["Stop Loss"]):,.2f}</strong></div>
+            <div class="top-trade-line">Target: <strong>{float(top["Target"]):,.2f}</strong></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def render_scan_status(signals: pd.DataFrame, errors: list[str]) -> None:
@@ -1649,7 +2056,11 @@ def render_scan_status(signals: pd.DataFrame, errors: list[str]) -> None:
         st.warning("No market data was available to scan. Check the error above or enable 'Use sample data' in the sidebar.")
         return
 
-    trade_count = int(signals["Signal"].isin(["STRONG_LONG", "STRONG_SHORT", "WEAK_LONG", "WEAK_SHORT"]).sum())
+    trade_count = int(
+        signals["Signal"].isin(
+            ["STRONG_LONG", "STRONG_SHORT", "EARLY_LONG", "EARLY_SHORT", "WEAK_LONG", "WEAK_SHORT"]
+        ).sum()
+    )
     if trade_count == 0:
         st.warning("Market data loaded, but no stocks produced strong or weak trade signals. All scanned symbols are WAIT.")
 
@@ -1666,9 +2077,8 @@ def main() -> None:
     option_symbols, options_error = load_option_list()
     symbols, config, period, interval, use_sample_data = render_sidebar(fno_symbols, option_symbols)
 
-    st.title("Futures Trading Dashboard")
+    st.subheader("📊 Trading Dashboard")
     last_updated = datetime.now().strftime("%d %b %Y, %H:%M:%S")
-    st.caption(f"Server binding: {DEFAULT_STREAMLIT_HOST}:{DEFAULT_STREAMLIT_PORT}")
 
     if fno_error:
         st.warning(fno_error)
@@ -1693,6 +2103,7 @@ def main() -> None:
             init_db(connection)
             process_exits(connection, signals)
             update_signals(connection, signals, timestamp)
+            performance_metrics = refresh_performance_metrics(connection)
             connection.commit()
             active_history = get_active_trades(connection)
             closed_history = get_trade_history(connection)
@@ -1701,9 +2112,10 @@ def main() -> None:
         st.error(f"Database error: {exc}")
         active_history = empty_history_table()
         closed_history = empty_history_table()
+        performance_metrics = default_performance_metrics()
 
-    long_trades = ranked_trades(signals, {"STRONG_LONG", "WEAK_LONG"})
-    short_trades = ranked_trades(signals, {"STRONG_SHORT", "WEAK_SHORT"})
+    long_trades = ranked_trades(signals, {"STRONG_LONG", "EARLY_LONG", "WEAK_LONG"})
+    short_trades = ranked_trades(signals, {"STRONG_SHORT", "EARLY_SHORT", "WEAK_SHORT"})
     wait_trades = ranked_trades(signals, {"WAIT"})
     long_options = build_options_plan(long_trades, option_symbols, config)
     short_options = build_options_plan(short_trades, option_symbols, config)
@@ -1715,17 +2127,19 @@ def main() -> None:
     logger.info("LONG signals: %s", len(long_trades))
     logger.info("SHORT signals: %s", len(short_trades))
 
-    render_market_regime(regime)
-    render_summary(signals, last_updated)
+    render_top_trade_highlight(signals)
+    render_market_regime(regime, signals, last_updated)
     render_scan_status(signals, errors)
     render_active_trades(active_history, signals)
     render_exit_signals(closed_history)
     render_closed_trades(closed_history)
-    render_trade_section("🟢 LONG SWING TRADES", long_trades, long_options, "LONG")
-    render_trade_section("🔴 SHORT SWING TRADES", short_trades, short_options, "SHORT")
+    render_trade_section("🟢 LONG Trades", long_trades, long_options, "LONG")
+    render_trade_section("🔴 SHORT Trades", short_trades, short_options, "SHORT")
 
-    with st.expander("🔴 No Trade"):
-        st.dataframe(format_futures_table(wait_trades), use_container_width=True, hide_index=True)
+    with st.expander(f"⏸️ No Trade ({len(wait_trades)})", expanded=False):
+        st.dataframe(format_futures_table(wait_trades.head(15)), use_container_width=True, hide_index=True)
+
+    render_performance_dashboard(performance_metrics)
 
     if errors:
         with st.expander(f"Skipped Symbols / Errors ({len(errors)})"):
