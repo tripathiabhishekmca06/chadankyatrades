@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import http.cookiejar
+import json
 import logging
 import os
 import re
 import sqlite3
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -15,12 +19,20 @@ import streamlit as st
 
 
 APP_DIR = Path(__file__).resolve().parent
-FNO_LIST_PATH = APP_DIR / "fno_list.csv"
-OPTIONS_LIST_PATH = APP_DIR / "options_list.csv"
+DATA_DIR = APP_DIR / "data"
+FNO_LIST_PATH = DATA_DIR / "fno_list.csv"
+OPTIONS_LIST_PATH = DATA_DIR / "options_list.csv"
 SIGNALS_DB_PATH = APP_DIR / "signals.db"
 LOG_PATH = APP_DIR / "dashboard_errors.log"
 
 OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
+
+NSE_BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json",
+    "Referer": "https://www.nseindia.com/",
+    "Connection": "keep-alive",
+}
 
 FUTURES_COLUMNS = [
     "Stock",
@@ -30,6 +42,7 @@ FUTURES_COLUMNS = [
     "Entry",
     "Current Price",
     "EMA20",
+    "EMA50",
     "Stop Loss",
     "Target",
     "RSI",
@@ -41,6 +54,19 @@ FUTURES_COLUMNS = [
     "Structure Break",
     "Distance from EMA20 %",
     "Confidence Score",
+    "Trade Quality",
+    "promoter_activity",
+    "trend_direction",
+    "ema_condition",
+    "rsi_value",
+    "rsi_condition",
+    "volume_value",
+    "volume_condition",
+    "distance_from_ema",
+    "distance_condition",
+    "trend_strength",
+    "strategy_type",
+    "failed_conditions",
     "Exit Signal",
     "Reason",
 ]
@@ -94,6 +120,7 @@ SIGNAL_TYPE_PRIORITY = {
     "PULLBACK_SHORT": 1,
     "BREAKOUT_LONG": 2,
     "BREAKOUT_SHORT": 2,
+    "STRUCTURE_BREAK": 2,
     "TREND_LONG": 3,
     "TREND_SHORT": 3,
     "": 9,
@@ -136,6 +163,7 @@ if not logger.handlers:
 def configure_runtime_environment() -> None:
     # Ensure local writable paths exist for cloud/container environments.
     SIGNALS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     # yfinance attempts to use a user cache directory that may be unavailable in cloud sandboxes.
@@ -421,6 +449,270 @@ def fetch_index_data(symbol: str = "^NSEI", period: str = "1y", interval: str = 
     if cleaned.empty:
         raise RuntimeError(f"Index response had no valid OHLC rows for {symbol}")
     return cleaned
+
+
+def _nse_corporates_pit_records(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if isinstance(payload, dict):
+        for key in ("data", "Data", "records", "result"):
+            rows = payload.get(key)
+            if isinstance(rows, list):
+                return [row for row in rows if isinstance(row, dict)]
+    return []
+
+
+def _nse_numeric_field(row: dict[str, Any], *names: str) -> float:
+    for name in names:
+        if name in row and row[name] not in (None, "", "-"):
+            try:
+                return float(row[name])
+            except (TypeError, ValueError):
+                continue
+    return 0.0
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_nse_promoter_net_by_symbol() -> dict[str, float]:
+    """
+    Single cached call to NSE corporates PIT (equities). Returns underlying symbol -> net promoter qty (buy - sell).
+    On failure returns {} (caller maps to NO_DATA).
+    """
+    try:
+        cookie_jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+        opener.addheaders = [(key, value) for key, value in NSE_BROWSER_HEADERS.items()]
+
+        opener.open(urllib.request.Request("https://www.nseindia.com/"), timeout=12).read()
+
+        api_url = "https://www.nseindia.com/api/corporates-pit?index=equities"
+        with opener.open(urllib.request.Request(api_url), timeout=20) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+        payload = json.loads(raw)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+        logger.info("NSE corporates-pit fetch failed: %s", exc)
+        return {}
+    except Exception as exc:
+        logger.exception("Unexpected NSE corporates-pit error: %s", exc)
+        return {}
+
+    records = _nse_corporates_pit_records(payload)
+    if not records:
+        return {}
+
+    net_by_symbol: dict[str, float] = {}
+    for row in records:
+        category = str(row.get("personCategory") or row.get("personcategory") or "").strip().upper()
+        if not category:
+            continue
+        if "PROMOTER" not in category:
+            continue
+
+        sym_raw = row.get("symbol") or row.get("sym") or row.get("tradingSymbol") or row.get("company")
+        sym = clean_underlying_symbol(sym_raw)
+        if not sym:
+            continue
+
+        buy_qty = _nse_numeric_field(row, "buyQuantity", "buyquantity", "buyQty", "buyqty")
+        sell_qty = _nse_numeric_field(row, "sellQuantity", "sellquantity", "sellQty", "sellqty")
+        net_by_symbol[sym] = net_by_symbol.get(sym, 0.0) + (buy_qty - sell_qty)
+
+    return net_by_symbol
+
+
+def strategy_type_label(signal_type: str) -> str:
+    if not signal_type:
+        return "—"
+    upper = str(signal_type).upper()
+    if upper.startswith("PULLBACK"):
+        return "Pullback"
+    if upper.startswith("BREAKOUT") or upper.startswith("STRUCTURE"):
+        return "Breakout"
+    if upper.startswith("TREND"):
+        return "Trend"
+    return "—"
+
+
+def trade_quality_label(signal: str, failed_conditions: list[str]) -> str:
+    fail_n = len(failed_conditions)
+    if str(signal).startswith("STRONG") and fail_n == 0:
+        return "High Quality"
+    if str(signal).startswith("WEAK"):
+        return "Moderate"
+    if fail_n >= 2:
+        return "Low Confidence"
+    return "Moderate"
+
+
+def build_explainability(
+    signal: str,
+    signal_type: str,
+    close: float,
+    ema20: float,
+    ema50: float,
+    rsi: float,
+    volume: float,
+    avg_volume: float,
+    distance_from_ema20: float,
+    trend_strength: float,
+    config: StrategyConfig,
+    market_type: str,
+) -> dict[str, Any]:
+    bullish = ema20 > ema50
+    bearish = ema20 < ema50
+    if bullish:
+        trend_direction = "LONG"
+    elif bearish:
+        trend_direction = "SHORT"
+    else:
+        trend_direction = "NEUTRAL"
+
+    direction = signal_direction(signal)
+    if direction == "LONG":
+        ema_condition = bool(bullish)
+    elif direction == "SHORT":
+        ema_condition = bool(bearish)
+    else:
+        ema_condition = bool(bullish or bearish)
+    rsi_ok_long = rsi >= config.long_rsi
+    rsi_ok_short = rsi <= config.short_rsi
+    if direction == "LONG":
+        rsi_condition = "RSI ok" if rsi_ok_long else "RSI weak"
+    elif direction == "SHORT":
+        rsi_condition = "RSI ok" if rsi_ok_short else "RSI weak"
+    else:
+        rsi_condition = "Neutral"
+
+    volume_ok = volume > avg_volume if avg_volume and avg_volume > 0 else False
+    volume_condition = "Above avg" if volume_ok else "Below avg"
+
+    distance_ok = distance_from_ema20 < config.overextended_max
+    distance_condition = "Near EMA20" if distance_ok else "Too far from EMA"
+
+    trend_ok = trend_strength > config.trend_strength_min
+    trend_strength_val = float(trend_strength)
+
+    failed: list[str] = []
+    if direction == "LONG" and not bullish:
+        failed.append("EMA trend misaligned")
+    if direction == "SHORT" and not bearish:
+        failed.append("EMA trend misaligned")
+    if direction == "LONG" and not rsi_ok_long:
+        failed.append("RSI weak")
+    if direction == "SHORT" and not rsi_ok_short:
+        failed.append("RSI weak")
+    if not volume_ok:
+        failed.append("Low volume")
+    if not distance_ok:
+        failed.append("Too far from EMA")
+    if not trend_ok:
+        failed.append("Weak trend")
+
+    if signal == "WAIT":
+        if market_type not in {"TRENDING_BULLISH", "TRENDING_BEARISH"}:
+            failed.append("Market regime not trending")
+        elif market_type == "TRENDING_BULLISH" and not bullish:
+            failed.append("Stock not bullish vs regime")
+        elif market_type == "TRENDING_BEARISH" and not bearish:
+            failed.append("Stock not bearish vs regime")
+        else:
+            failed.append("Setup not ready")
+
+    failed = list(dict.fromkeys(failed))
+
+    return {
+        "trend_direction": trend_direction,
+        "ema_condition": ema_condition,
+        "rsi_value": float(rsi),
+        "rsi_condition": rsi_condition,
+        "volume_value": float(volume),
+        "volume_condition": volume_condition,
+        "distance_from_ema": float(distance_from_ema20),
+        "distance_condition": distance_condition,
+        "trend_strength": trend_strength_val,
+        "strategy_type": strategy_type_label(signal_type),
+        "failed_conditions": failed,
+        "trade_quality": trade_quality_label(signal, failed),
+    }
+
+
+def merge_promoter_activity_and_adjust_confidence(
+    signals: pd.DataFrame,
+    active_history: pd.DataFrame,
+    use_sample_data: bool,
+) -> pd.DataFrame:
+    if signals.empty:
+        return signals
+
+    df = signals.copy()
+    if "promoter_activity" not in df.columns:
+        df["promoter_activity"] = "NO_DATA"
+
+    candidate_symbols: set[str] = set()
+    for _, row in df.iterrows():
+        sig = str(row.get("Signal", ""))
+        if sig in {"STRONG_LONG", "STRONG_SHORT", "WEAK_LONG", "WEAK_SHORT"}:
+            sym = clean_underlying_symbol(row.get("Stock")) or ""
+            if sym:
+                candidate_symbols.add(sym.upper())
+
+    if not active_history.empty and "stock" in active_history.columns:
+        for sym in active_history["stock"].tolist():
+            cleaned = clean_underlying_symbol(sym) or ""
+            if cleaned:
+                candidate_symbols.add(cleaned.upper())
+
+    if use_sample_data or not candidate_symbols:
+        df["promoter_activity"] = "NO_DATA"
+        return df
+
+    net_map = fetch_nse_promoter_net_by_symbol()
+
+    def classify_promoter(net: float) -> str:
+        if net > 0:
+            return "BUYING"
+        if net < 0:
+            return "SELLING"
+        if net == 0:
+            return "NEUTRAL"
+        return "NO_DATA"
+
+    promoter_labels: list[str] = []
+    for _, row in df.iterrows():
+        sym = clean_underlying_symbol(row.get("Stock")) or ""
+        sym_u = sym.upper()
+        if sym_u not in candidate_symbols:
+            promoter_labels.append("NO_DATA")
+            continue
+        net = net_map.get(sym_u)
+        if net is None:
+            promoter_labels.append("NO_DATA")
+        else:
+            promoter_labels.append(classify_promoter(float(net)))
+
+    df["promoter_activity"] = promoter_labels
+
+    adjusted_scores: list[int] = []
+    for _, row in df.iterrows():
+        score = int(pd.to_numeric(row.get("Confidence Score"), errors="coerce") or 0)
+        sig = str(row.get("Signal", ""))
+        promo = str(row.get("promoter_activity", "NO_DATA"))
+        direction = signal_direction(sig)
+
+        if is_trade_signal(sig) and promo not in {"", "NO_DATA"}:
+            if direction == "LONG" and promo == "BUYING":
+                score += 1
+            elif direction == "SHORT" and promo == "SELLING":
+                score += 1
+            elif direction == "LONG" and promo == "SELLING":
+                score -= 1
+            elif direction == "SHORT" and promo == "BUYING":
+                score -= 1
+
+        adjusted_scores.append(int(max(0, min(5, score))))
+
+    df["Confidence Score"] = adjusted_scores
+    return df
 
 
 def make_sample_history(symbol: str, periods: int = 180) -> pd.DataFrame:
@@ -747,6 +1039,22 @@ def init_db(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS selected_trades (
+            stock TEXT PRIMARY KEY,
+            signal_type TEXT,
+            entry_price REAL,
+            stop_loss REAL,
+            target REAL,
+            selected_timestamp TEXT,
+            status TEXT
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_selected_status ON selected_trades(status)"
+    )
     connection.commit()
 
 
@@ -838,8 +1146,106 @@ def close_trade(connection: sqlite3.Connection, stock: str, exit_price: float, r
                 int(active_trade["id"]),
             ),
         )
+        connection.execute(
+            """
+            UPDATE selected_trades
+            SET status = 'CLOSED'
+            WHERE stock = ? AND status = 'ACTIVE'
+            """,
+            (str(stock).upper(),),
+        )
     except sqlite3.OperationalError as exc:
         logger.exception("Failed to close trade for %s: %s", stock, exc)
+
+
+def get_active_selected_trades(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT stock, signal_type, entry_price, stop_loss, target, selected_timestamp, status
+        FROM selected_trades
+        WHERE status = 'ACTIVE'
+        ORDER BY selected_timestamp DESC
+        """
+    ).fetchall()
+
+
+def insert_selected_trade_from_row(connection: sqlite3.Connection, row: pd.Series) -> bool:
+    signal = str(row.get("Signal", ""))
+    if not is_trade_signal(signal):
+        return False
+    stock = str(row["Stock"]).upper()
+    entry = float(row.get("Entry", np.nan))
+    sl = float(row.get("Stop Loss", np.nan))
+    tgt = float(row.get("Target", np.nan))
+    if any(np.isnan(v) for v in (entry, sl, tgt)):
+        return False
+    sig_type = str(row.get("Signal Type", "") or "")
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur = connection.execute(
+        """
+        INSERT OR IGNORE INTO selected_trades (
+            stock, signal_type, entry_price, stop_loss, target, selected_timestamp, status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE')
+        """,
+        (stock, sig_type, entry, sl, tgt, ts),
+    )
+    return (cur.rowcount or 0) > 0
+
+
+def delete_selected_trade(connection: sqlite3.Connection, stock: str) -> None:
+    connection.execute("DELETE FROM selected_trades WHERE stock = ?", (str(stock).upper(),))
+
+
+def mark_selected_trade_closed_manual(connection: sqlite3.Connection, stock: str) -> None:
+    connection.execute(
+        "UPDATE selected_trades SET status = 'CLOSED' WHERE stock = ?",
+        (str(stock).upper(),),
+    )
+
+
+def signals_row_for_stock(signals: pd.DataFrame, stock: str) -> pd.Series | None:
+    if signals.empty or "Stock" not in signals.columns:
+        return None
+    mask = signals["Stock"].astype(str).str.upper() == str(stock).upper()
+    if not mask.any():
+        return None
+    return signals.loc[mask].iloc[0]
+
+
+def direction_from_stored_signal_type(signal_type: str) -> str:
+    t = str(signal_type).upper()
+    if "SHORT" in t:
+        return "SHORT"
+    if "LONG" in t:
+        return "LONG"
+    return "WAIT"
+
+
+def monitoring_exit_triggered(direction: str, price: float, ema50: float, rsi: float) -> bool:
+    if direction == "LONG":
+        return bool(price < ema50 or rsi < 45)
+    if direction == "SHORT":
+        return bool(price > ema50 or rsi > 55)
+    return False
+
+
+def sl_target_distance_pct_of_entry(
+    direction: str, entry: float, current: float, sl: float, tgt: float
+) -> tuple[float, float]:
+    if not entry or np.isnan(entry):
+        return np.nan, np.nan
+    if direction == "LONG":
+        return (
+            (current - sl) / entry * 100.0,
+            (tgt - current) / entry * 100.0,
+        )
+    if direction == "SHORT":
+        return (
+            (sl - current) / entry * 100.0,
+            (current - tgt) / entry * 100.0,
+        )
+    return np.nan, np.nan
 
 
 def get_trade_history(connection: sqlite3.Connection, limit: int = 20) -> pd.DataFrame:
@@ -1329,6 +1735,21 @@ def evaluate_symbol(
     elif is_short_signal(signal) and (rsi > 50 or close > ema20):
         exit_signal = "SHORT early exit"
 
+    explain = build_explainability(
+        signal=signal,
+        signal_type=str(signal_type),
+        close=close,
+        ema20=ema20,
+        ema50=ema50,
+        rsi=rsi,
+        volume=volume,
+        avg_volume=avg_volume,
+        distance_from_ema20=distance_from_ema20,
+        trend_strength=trend_strength,
+        config=config,
+        market_type=market_type,
+    )
+
     return {
         "Stock": symbol,
         "Signal": signal,
@@ -1337,6 +1758,7 @@ def evaluate_symbol(
         "Entry": entry,
         "Current Price": close,
         "EMA20": ema20,
+        "EMA50": ema50,
         "Stop Loss": stop_loss,
         "Target": target,
         "RSI": rsi,
@@ -1348,6 +1770,19 @@ def evaluate_symbol(
         "Structure Break": "Yes" if structure_break else "No",
         "Distance from EMA20 %": distance_from_ema20 * 100,
         "Confidence Score": score,
+        "Trade Quality": explain["trade_quality"],
+        "promoter_activity": "NO_DATA",
+        "trend_direction": explain["trend_direction"],
+        "ema_condition": explain["ema_condition"],
+        "rsi_value": explain["rsi_value"],
+        "rsi_condition": explain["rsi_condition"],
+        "volume_value": explain["volume_value"],
+        "volume_condition": explain["volume_condition"],
+        "distance_from_ema": explain["distance_from_ema"],
+        "distance_condition": explain["distance_condition"],
+        "trend_strength": explain["trend_strength"],
+        "strategy_type": explain["strategy_type"],
+        "failed_conditions": explain["failed_conditions"],
         "Exit Signal": exit_signal,
         "Reason": reason,
     }
@@ -1359,6 +1794,7 @@ def analyze_stock(
     config: StrategyConfig,
     market_regime: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
+    """Scan-time entrypoint: returns full futures row including explainability fields (see evaluate_symbol)."""
     return evaluate_symbol(symbol, history, config, market_regime)
 
 
@@ -1596,14 +2032,19 @@ def format_futures_table(data: pd.DataFrame):
         {
             "Entry": "{:,.2f}",
             "EMA20": "{:,.2f}",
+            "EMA50": "{:,.2f}",
             "Stop Loss": "{:,.2f}",
             "Target": "{:,.2f}",
             "RSI": "{:,.1f}",
+            "rsi_value": "{:,.1f}",
             "ATR": "{:,.2f}",
             "Volume": "{:,.0f}",
             "Avg Volume": "{:,.0f}",
+            "volume_value": "{:,.0f}",
             "Volume Strength": "{:,.2f}x",
             "Distance from EMA20 %": "{:,.2f}",
+            "distance_from_ema": "{:,.4f}",
+            "trend_strength": "{:,.4f}",
             "Confidence Score": "{:.0f}",
         },
         na_rep="-",
@@ -1705,6 +2146,27 @@ def inject_css() -> None:
             border-left: 4px solid #c62828;
             color: #421111;
         }
+        .selected-focus-card {
+            border: 3px solid #1565c0;
+            border-radius: 14px;
+            margin-bottom: 14px;
+            padding: 18px 20px;
+            background: linear-gradient(180deg, rgba(21, 101, 192, 0.09) 0%, rgba(255, 255, 255, 0.97) 55%);
+            box-shadow: 0 8px 22px rgba(21, 101, 192, 0.14);
+        }
+        .selected-focus-card .card-stock {
+            font-size: 1.2rem;
+            margin-bottom: 8px;
+        }
+        .selected-focus-card .card-line {
+            font-size: 0.88rem;
+            margin: 4px 0;
+        }
+        .selected-focus-card .focus-banner {
+            font-size: 1.05rem;
+            font-weight: 800;
+            margin: 10px 0 6px 0;
+        }
         .card-stock {
             font-size: 0.95rem;
             font-weight: 800;
@@ -1787,6 +2249,122 @@ def inject_css() -> None:
     )
 
 
+def _failed_messages(raw: Any) -> list[str]:
+    if isinstance(raw, list):
+        return [str(item) for item in raw if str(item).strip()]
+    if isinstance(raw, str) and raw.strip():
+        return [part.strip() for part in raw.split("||") if part.strip()]
+    return []
+
+
+def render_selected_trades_focus(signals: pd.DataFrame) -> None:
+    st.subheader("⭐ SELECTED TRADES")
+    with get_db_connection() as conn:
+        init_db(conn)
+        selected_rows = get_active_selected_trades(conn)
+        if not selected_rows:
+            st.caption(
+                "No stocks in your focus list. Expand **LONG TRADES** or **SHORT TRADES** and press **Select Trade** on a card."
+            )
+            return
+        for sel in selected_rows:
+            stock = str(sel["stock"]).upper()
+            entry = float(sel["entry_price"])
+            sl = float(sel["stop_loss"])
+            tgt = float(sel["target"])
+            live = signals_row_for_stock(signals, stock)
+            if live is not None and is_trade_signal(str(live.get("Signal", ""))):
+                direction = signal_direction(str(live["Signal"]))
+            else:
+                direction = direction_from_stored_signal_type(str(sel["signal_type"] or ""))
+
+            cur_price = float(live["Current Price"]) if live is not None else np.nan
+            ema50v = np.nan
+            rsiv = np.nan
+            if live is not None:
+                if "EMA50" in live.index and pd.notna(live.get("EMA50")):
+                    ema50v = float(live["EMA50"])
+                if pd.notna(live.get("RSI")):
+                    rsiv = float(live["RSI"])
+
+            pnl_s = "—"
+            exit_sig = False
+            if direction in {"LONG", "SHORT"} and not np.isnan(cur_price):
+                pnl_val = pnl_pct(direction, entry, cur_price)
+                if not np.isnan(pnl_val):
+                    pnl_s = f"{pnl_val:+.2f}%"
+                if not np.isnan(ema50v) and not np.isnan(rsiv):
+                    exit_sig = monitoring_exit_triggered(direction, cur_price, ema50v, rsiv)
+
+            if direction in {"LONG", "SHORT"} and not np.isnan(cur_price):
+                d_sl, d_tgt = sl_target_distance_pct_of_entry(direction, entry, cur_price, sl, tgt)
+            else:
+                d_sl, d_tgt = np.nan, np.nan
+
+            price_s = f"{cur_price:,.2f}" if not np.isnan(cur_price) else "—"
+            dist_sl_s = f"{d_sl:+.2f}% of entry" if not np.isnan(d_sl) else "—"
+            dist_tgt_s = f"{d_tgt:+.2f}% of entry" if not np.isnan(d_tgt) else "—"
+
+            banner_html = (
+                '<div class="focus-banner" style="color:#b71c1c;">🚨 EXIT SIGNAL</div>'
+                if exit_sig
+                else '<div class="focus-banner" style="color:#1b5e20;">✅ HOLD</div>'
+            )
+            dir_label = direction if direction != "WAIT" else "—"
+
+            st.markdown(
+                f"""
+                <div class="selected-focus-card">
+                    <div class="card-stock">{stock}</div>
+                    <div class="card-line">Direction <strong>{dir_label}</strong></div>
+                    <div class="card-line">Entry <strong>{entry:,.2f}</strong> · Current <strong>{price_s}</strong> · P&amp;L <strong>{pnl_s}</strong></div>
+                    <div class="card-line">Stop loss <strong>{sl:,.2f}</strong> · Target <strong>{tgt:,.2f}</strong></div>
+                    <div class="card-line">Distance from SL (vs entry %): <strong>{dist_sl_s}</strong></div>
+                    <div class="card-line">Distance from target (vs entry %): <strong>{dist_tgt_s}</strong></div>
+                    {banner_html}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            c1, c2, _sp = st.columns([1, 1, 6])
+            with c1:
+                if st.button("Remove Trade", key=f"sel_remove_{stock}"):
+                    delete_selected_trade(conn, stock)
+                    conn.commit()
+                    st.rerun()
+            with c2:
+                if st.button("Mark as Closed", key=f"sel_closed_{stock}"):
+                    mark_selected_trade_closed_manual(conn, stock)
+                    conn.commit()
+                    st.rerun()
+
+
+def render_trade_explain_body(row: pd.Series) -> None:
+    stock = str(row.get("Stock", "UNKNOWN"))
+    st.markdown(f"**Stock:** {stock}")
+    st.markdown(f"**Trend direction:** {row.get('trend_direction', '—')}")
+    st.markdown(f"**EMA aligned:** {row.get('ema_condition', '—')}")
+    st.markdown(
+        f"**RSI:** {float(row.get('rsi_value', row.get('RSI', 0)) or 0):.1f} — {row.get('rsi_condition', '—')}"
+    )
+    st.markdown(
+        f"**Volume:** {float(row.get('volume_value', row.get('Volume', 0)) or 0):,.0f} — {row.get('volume_condition', '—')}"
+    )
+    st.markdown(
+        f"**Distance from EMA20:** {float(row.get('distance_from_ema', 0) or 0) * 100:.2f}% — {row.get('distance_condition', '—')}"
+    )
+    st.markdown(f"**Strategy:** {row.get('strategy_type', '—')}")
+    st.markdown(f"**Promoter activity:** {row.get('promoter_activity', 'NO_DATA')}")
+    st.markdown(
+        f"**Confidence:** {int(row.get('Confidence Score', 0) or 0)}/5 · **Quality:** {row.get('Trade Quality', '—')}"
+    )
+    failures = _failed_messages(row.get("failed_conditions"))
+    if failures:
+        st.markdown("**Why not perfect:**")
+        for item in failures:
+            st.markdown(f"- {item}")
+
+
 def render_trade_cards(data: pd.DataFrame, side: str) -> None:
     if data.empty:
         st.info("No long setups today" if side == "LONG" else "No short setups today")
@@ -1796,23 +2374,50 @@ def render_trade_cards(data: pd.DataFrame, side: str) -> None:
     for start in range(0, len(data), cards_per_row):
         chunk = data.iloc[start : start + cards_per_row]
         columns = st.columns(len(chunk))
-        for column, (_, row) in zip(columns, chunk.iterrows()):
+        for pos, (column, (_, row)) in enumerate(zip(columns, chunk.iterrows())):
             direction = signal_direction(str(row["Signal"]))
             card_class = "long-card" if direction == "LONG" else "short-card"
+            promoter = str(row.get("promoter_activity", "NO_DATA") or "NO_DATA")
+            quality = str(row.get("Trade Quality", "—") or "—")
 
             with column:
-                st.markdown(
-                    f"""
-                    <div class="compact-card {card_class}">
-                        <div class="card-stock">{"🟢" if direction == "LONG" else "🔴"} {row["Stock"]}</div>
-                        <div class="card-line">Entry <strong>{row["Entry"]:,.2f}</strong></div>
-                        <div class="card-line">SL <strong>{row["Stop Loss"]:,.2f}</strong></div>
-                        <div class="card-line">Target <strong>{row["Target"]:,.2f}</strong></div>
-                        <div class="card-score">Conf {int(row["Confidence Score"])}/5 · {signal_strength(str(row["Signal"]))}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+                card_col, why_col = st.columns([5.2, 1], gap="small")
+                with card_col:
+                    st.markdown(
+                        f"""
+                        <div class="compact-card {card_class}">
+                            <div class="card-stock">{"🟢" if direction == "LONG" else "🔴"} {row["Stock"]}</div>
+                            <div class="card-line">Entry <strong>{row["Entry"]:,.2f}</strong></div>
+                            <div class="card-line">SL <strong>{row["Stop Loss"]:,.2f}</strong></div>
+                            <div class="card-line">Target <strong>{row["Target"]:,.2f}</strong></div>
+                            <div class="card-score">Conf {int(row["Confidence Score"])}/5 · {signal_strength(str(row["Signal"]))}</div>
+                            <div class="card-line">Promoter <strong>{promoter}</strong></div>
+                            <div class="card-line">Quality <strong>{quality}</strong></div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                with why_col:
+                    # Streamlit 1.34 popover has no `key=`; unique invisible suffix avoids duplicate widget ids.
+                    _why_label = "ℹ️" + ("\u200c" * (start * 10 + pos + 1))
+                    with st.popover(
+                        _why_label,
+                        help="Why this trade? (click again or outside to close)",
+                    ):
+                        st.markdown("**Why this trade?**")
+                        render_trade_explain_body(row)
+                if is_trade_signal(str(row.get("Signal", ""))):
+                    btn_key = f"select_trade_{side}_{start}_{pos}"
+                    if st.button("Select Trade", key=btn_key, use_container_width=True):
+                        with get_db_connection() as wconn:
+                            init_db(wconn)
+                            inserted = insert_selected_trade_from_row(wconn, row)
+                            wconn.commit()
+                        if inserted:
+                            st.toast(f"{row['Stock']} added to selected trades", icon="⭐")
+                        else:
+                            st.toast("Already selected or invalid row", icon="ℹ️")
+                        st.rerun()
 
 
 def render_trade_section(
@@ -2033,6 +2638,7 @@ def render_top_trade_highlight(signals: pd.DataFrame) -> None:
     direction_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
     card_class = "" if direction == "LONG" else "short"
     score = int(pd.to_numeric(top.get("Confidence Score"), errors="coerce") or 0)
+    promoter = str(top.get("promoter_activity", "NO_DATA") or "NO_DATA")
 
     st.markdown(
         f"""
@@ -2042,6 +2648,7 @@ def render_top_trade_highlight(signals: pd.DataFrame) -> None:
             <div class="top-trade-line">Entry: <strong>{float(top["Entry"]):,.2f}</strong></div>
             <div class="top-trade-line">SL: <strong>{float(top["Stop Loss"]):,.2f}</strong></div>
             <div class="top-trade-line">Target: <strong>{float(top["Target"]):,.2f}</strong></div>
+            <div class="top-trade-line">Promoter: <strong>{promoter}</strong></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -2101,6 +2708,10 @@ def main() -> None:
     try:
         with get_db_connection() as connection:
             init_db(connection)
+            active_history = get_active_trades(connection)
+            signals = merge_promoter_activity_and_adjust_confidence(signals, active_history, use_sample_data)
+            if not signals.empty:
+                signals = sort_futures_table(signals)
             process_exits(connection, signals)
             update_signals(connection, signals, timestamp)
             performance_metrics = refresh_performance_metrics(connection)
@@ -2113,6 +2724,9 @@ def main() -> None:
         active_history = empty_history_table()
         closed_history = empty_history_table()
         performance_metrics = default_performance_metrics()
+        signals = merge_promoter_activity_and_adjust_confidence(signals, active_history, use_sample_data)
+        if not signals.empty:
+            signals = sort_futures_table(signals)
 
     long_trades = ranked_trades(signals, {"STRONG_LONG", "EARLY_LONG", "WEAK_LONG"})
     short_trades = ranked_trades(signals, {"STRONG_SHORT", "EARLY_SHORT", "WEAK_SHORT"})
@@ -2127,14 +2741,15 @@ def main() -> None:
     logger.info("LONG signals: %s", len(long_trades))
     logger.info("SHORT signals: %s", len(short_trades))
 
+    render_selected_trades_focus(signals)
     render_top_trade_highlight(signals)
     render_market_regime(regime, signals, last_updated)
     render_scan_status(signals, errors)
+    render_trade_section("🟢 LONG TRADES", long_trades, long_options, "LONG")
+    render_trade_section("🔴 SHORT TRADES", short_trades, short_options, "SHORT")
     render_active_trades(active_history, signals)
     render_exit_signals(closed_history)
     render_closed_trades(closed_history)
-    render_trade_section("🟢 LONG Trades", long_trades, long_options, "LONG")
-    render_trade_section("🔴 SHORT Trades", short_trades, short_options, "SHORT")
 
     with st.expander(f"⏸️ No Trade ({len(wait_trades)})", expanded=False):
         st.dataframe(format_futures_table(wait_trades.head(15)), use_container_width=True, hide_index=True)

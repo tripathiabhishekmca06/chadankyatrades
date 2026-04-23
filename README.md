@@ -1,54 +1,58 @@
 # Futures Trading Dashboard
 
-Streamlit-based trading dashboard for scanning NSE futures symbols, generating technical trade signals, and tracking active/closed trades using SQLite.
+Streamlit app for scanning an NSE-style FNO symbol list, generating technical trade signals, and tracking active and closed trades in SQLite.
 
-## Features
+## Repository layout
 
-- Signal generation from EMA/RSI/ATR/volume + market regime filters
-- Separate LONG and SHORT trade sections with card-based UI
-- Active trades tracking with stop-loss, target, and exit-reason updates
-- Closed trade history with P&L capture
-- Optional sample-data mode for offline testing
+| Path | Purpose |
+|------|---------|
+| `app.py` | Main Streamlit entrypoint |
+| `data/fno_list.csv` | Universe CSV (`symbol` column); required for scans |
+| `data/options_list.csv` | Optional options universe (omit file if unused) |
+| `requirements.txt` | Python dependencies for Cloud and local installs |
+| `runtime.txt` | Python version for [Streamlit Community Cloud](https://share.streamlit.io) |
+| `.streamlit/config.toml` | Portable Streamlit settings (no host or port overrides) |
+| `.gitignore` | Local venv, DB, logs, cache, secrets |
 
-## Project Structure
+Runtime SQLite (`signals.db`) and logs are created next to `app.py` on first run and are not committed.
 
-- `app.py` - main Streamlit app
-- `requirements.txt` - Python dependencies
-- `.gitignore` - ignored local/runtime files
-- `README.md` - setup and deployment guide
-
-## Run Locally
+## Run locally
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-The app auto-creates `signals.db` in the project directory if it does not exist.
-
-## Deployment (GitHub + Streamlit Cloud)
-
-### 1) Push to GitHub
+Optional local bind (e.g. Docker):
 
 ```bash
-git init
-git add .
-git commit -m "Prepare Streamlit trading dashboard for cloud deployment"
-git branch -M main
-git remote add origin <repo_url>
-git push -u origin main
+streamlit run app.py --server.address 0.0.0.0 --server.port 8501
 ```
 
-### 2) Deploy on Streamlit Cloud
+## Deploy on Streamlit Community Cloud
 
-1. Go to [https://share.streamlit.io](https://share.streamlit.io)
-2. Sign in and connect your GitHub account
-3. Choose your repository and branch (`main`)
-4. Set main file path to `app.py`
-5. Click **Deploy**
+1. Push this repository to GitHub (see below).
+2. Open [share.streamlit.io](https://share.streamlit.io), sign in, and **New app**.
+3. Pick the repo and branch (`main`).
+4. Set **Main file path** to `app.py`.
+5. **Deploy**. Cloud installs from `requirements.txt` and uses `runtime.txt` for Python.
 
-## Notes
+Secrets are optional. If you add API keys later, use **App settings → Secrets** and do not commit `.streamlit/secrets.toml`.
 
-- `sqlite3` is part of Python standard library and is not installed via `pip`.
-- Data fetching and symbol scans are cached with `@st.cache_data`.
-- The app includes error handling for missing symbol files, API failures, and empty market data responses.
+## Push to GitHub
+
+```bash
+git add -A
+git status
+git commit -m "Structure repo for Streamlit Cloud deployment"
+git push origin main
+```
+
+If the remote is not set yet:
+
+```bash
+git remote add origin https://github.com/<user>/<repo>.git
+git push -u origin main
+```

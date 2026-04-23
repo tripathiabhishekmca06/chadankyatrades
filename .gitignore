@@ -4,8 +4,11 @@ __pycache__/
 *.pyo
 *.pyd
 .env
+.streamlit/secrets.toml
+.yfinance_cache/
 *.db
 *.db-shm
 *.db-wal
 .DS_Store
 dashboard_errors.log
+*.log

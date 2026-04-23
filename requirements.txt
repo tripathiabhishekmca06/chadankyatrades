@@ -1,5 +1,5 @@
-streamlit>=1.34
-pandas>=2.2
-numpy>=1.26
-yfinance>=0.2.40
-ta>=0.11.0
+# Pinned loosely for reproducible Streamlit Community Cloud builds.
+streamlit>=1.34,<2
+pandas>=2.2,<3
+numpy>=1.26,<3
+yfinance>=0.2.40,<1
