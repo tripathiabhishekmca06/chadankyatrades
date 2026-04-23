@@ -2107,8 +2107,9 @@ def inject_css() -> None:
     st.markdown(
         """
         <style>
+        /* Space below Streamlit fixed header (Share / ⋮ / Deploy on Community Cloud). */
         .block-container {
-            padding-top: 0.6rem;
+            padding-top: 4.25rem;
             padding-bottom: 1.1rem;
         }
         h2, h3 {
@@ -2213,7 +2214,7 @@ def inject_css() -> None:
         }
         @media (max-width: 768px) {
             .block-container {
-                padding-top: 0.75rem;
+                padding-top: max(4.5rem, env(safe-area-inset-top, 0px) + 0.5rem);
                 padding-left: 0.75rem;
                 padding-right: 0.75rem;
                 padding-bottom: 1.5rem;
