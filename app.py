@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 from settings import get_alpha_vantage_api_key, get_eodhd_api_key
 
@@ -59,7 +60,6 @@ FUTURES_COLUMNS = [
     "Distance from EMA20 %",
     "Confidence Score",
     "Trade Quality",
-    "promoter_activity",
     "trend_direction",
     "ema_condition",
     "rsi_value",
@@ -147,6 +147,16 @@ SIGNAL_PRIORITY = {
 CACHE_TTL = 60
 ALPHA_API_KEY = get_alpha_vantage_api_key()
 EODHD_API_KEY = get_eodhd_api_key()
+
+ALPHA_API_MINUTE_LIMIT = 5
+ALPHA_API_DAY_LIMIT = 500
+EODHD_API_MINUTE_LIMIT = 20
+API_USAGE_STATE_KEY = "_api_usage_tracker_v1"
+MARKET_SESSION_CACHE_TTL = 90.0
+MARKET_FORCE_NEXT_KEY = "_market_force_refresh_next"
+MARKET_FETCH_META_KEY = "_market_fetch_meta"
+MARKET_QUOTA_FLAG_KEY = "_market_quota_low_flag"
+MARKET_SCAN_NONCE_KEY = "_market_scan_refresh_nonce"
 # EODHD intraday is one symbol per request; use parallel workers + Session to cut wall time.
 EODHD_FALLBACK_MAX_WORKERS = 4
 YAHOO_FETCH_CACHE_TTL_SECONDS = CACHE_TTL
@@ -465,6 +475,7 @@ def _fetch_alpha_intraday(yahoo_symbol: str, session: requests.Session | None = 
     }
     sess = session if session is not None else requests
     response = sess.get("https://www.alphavantage.co/query", params=params, timeout=20)
+    record_alpha_api_call()
     payload = response.json() if response.ok else {}
     series = payload.get("Time Series (15min)")
     if not isinstance(series, dict) or not series:
@@ -487,17 +498,19 @@ def _fetch_eodhd_intraday_or_daily(
     yahoo_symbol: str,
     session: requests.Session | None = None,
     throttle: bool = True,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, int]:
     if not EODHD_API_KEY:
-        return pd.DataFrame(columns=OHLCV_COLUMNS)
+        return pd.DataFrame(columns=OHLCV_COLUMNS), 0
     eod_symbol = _to_eodhd_symbol(yahoo_symbol)
     sess = session if session is not None else requests
+    http_calls = 0
 
     if throttle:
         _eodhd_wait()
     intraday_url = f"https://eodhd.com/api/intraday/{eod_symbol}"
     intraday_params = {"api_token": EODHD_API_KEY, "interval": "15m", "fmt": "json"}
     intraday_resp = sess.get(intraday_url, params=intraday_params, timeout=20)
+    http_calls += 1
     if intraday_resp.ok:
         payload = intraday_resp.json()
         if isinstance(payload, list) and payload:
@@ -514,18 +527,19 @@ def _fetch_eodhd_intraday_or_daily(
             )
             frame = _normalize_ohlcv_frame(rows)
             if not frame.empty:
-                return frame
+                return frame, http_calls
 
     if throttle:
         _eodhd_wait()
     daily_url = f"https://eodhd.com/api/eod/{eod_symbol}"
     daily_params = {"api_token": EODHD_API_KEY, "period": "d", "fmt": "json"}
     daily_resp = sess.get(daily_url, params=daily_params, timeout=20)
+    http_calls += 1
     if not daily_resp.ok:
-        return pd.DataFrame(columns=OHLCV_COLUMNS)
+        return pd.DataFrame(columns=OHLCV_COLUMNS), http_calls
     payload = daily_resp.json()
     if not isinstance(payload, list) or not payload:
-        return pd.DataFrame(columns=OHLCV_COLUMNS)
+        return pd.DataFrame(columns=OHLCV_COLUMNS), http_calls
     rows = pd.DataFrame(payload)
     rows["Datetime"] = pd.to_datetime(rows.get("date"), errors="coerce")
     rows = rows.set_index("Datetime").rename(
@@ -537,7 +551,7 @@ def _fetch_eodhd_intraday_or_daily(
             "volume": "Volume",
         }
     )
-    return _normalize_ohlcv_frame(rows)
+    return _normalize_ohlcv_frame(rows), http_calls
 
 
 def get_market_data(symbols: tuple[str, ...], interval: str = "15m", period: str = "7d") -> pd.DataFrame:
@@ -602,14 +616,15 @@ def get_market_data(symbols: tuple[str, ...], interval: str = "15m", period: str
                 frames_by_ticker[ticker] = frame
                 alpha_fallback_count += 1
 
-        def _eodhd_one(ticker: str) -> tuple[str, pd.DataFrame]:
+        def _eodhd_one(ticker: str) -> tuple[str, pd.DataFrame, int]:
             try:
-                return ticker, _fetch_eodhd_intraday_or_daily(
+                frame, n_http = _fetch_eodhd_intraday_or_daily(
                     ticker, session=http_session, throttle=False
                 )
+                return ticker, frame, n_http
             except Exception as exc:
                 logger.info("EODHD fetch failed for %s: %s", ticker, exc)
-                return ticker, pd.DataFrame(columns=OHLCV_COLUMNS)
+                return ticker, pd.DataFrame(columns=OHLCV_COLUMNS), 0
 
         if still_missing:
             max_workers = min(EODHD_FALLBACK_MAX_WORKERS, len(still_missing))
@@ -625,12 +640,15 @@ def get_market_data(symbols: tuple[str, ...], interval: str = "15m", period: str
                         except Exception as exc:
                             t_failed = future_map[fut]
                             logger.info("EODHD worker failed for %s: %s", t_failed, exc)
-                            eod_results.append((t_failed, pd.DataFrame(columns=OHLCV_COLUMNS)))
-            for ticker, frame in eod_results:
+                            eod_results.append((t_failed, pd.DataFrame(columns=OHLCV_COLUMNS), 0))
+            eod_http_total = 0
+            for ticker, frame, n_http in eod_results:
+                eod_http_total += int(n_http)
                 if frame.empty:
                     continue
                 frames_by_ticker[ticker] = frame
                 eodhd_fallback_count += 1
+            record_eodhd_api_calls(eod_http_total)
 
     print(f"Yahoo success count: {yahoo_success_count}")
     print(f"Alpha fallback count: {alpha_fallback_count}")
@@ -645,7 +663,12 @@ def get_market_data(symbols: tuple[str, ...], interval: str = "15m", period: str
 
 
 def download_market_data(symbols: tuple[str, ...], period: str, interval: str) -> pd.DataFrame:
-    return get_market_data(symbols, interval=interval or "15m", period=period or "7d")
+    df, _src, _age = get_market_data_with_cache(
+        symbols,
+        str(period or "7d"),
+        str(interval or "15m"),
+    )
+    return df if isinstance(df, pd.DataFrame) else _safe_empty_market_df()
 
 
 def fetch_index_data(symbol: str = "^NSEI", period: str = "1y", interval: str = "1d") -> pd.DataFrame:
@@ -766,6 +789,433 @@ def clear_market_data_cache() -> None:
     _YAHOO_LAST_CALL_TS = 0.0
     _ALPHA_LAST_CALL_TS = 0.0
     _EODHD_LAST_CALL_TS = 0.0
+    try:
+        st.session_state["market_cache"] = {"data": None, "timestamp": 0.0, "params": None}
+        st.session_state[MARKET_FETCH_META_KEY] = {"source": "FAILED", "age_seconds": 0.0, "ts": time.time()}
+    except Exception:
+        pass
+
+
+def _init_market_session_cache() -> None:
+    if "market_cache" not in st.session_state:
+        st.session_state.market_cache = {"data": None, "timestamp": 0.0, "params": None}
+
+
+def _safe_empty_market_df() -> pd.DataFrame:
+    return pd.DataFrame()
+
+
+def get_market_data_with_cache(
+    symbols: tuple[str, ...],
+    period: str,
+    interval: str,
+) -> tuple[pd.DataFrame, str, float]:
+    """
+    Short-lived session cache (60s) around get_market_data. Returns (df, source, age_seconds).
+    Never raises; never returns None.
+    """
+    _init_market_session_cache()
+    now = time.time()
+    cache = st.session_state.market_cache
+    period_s = str(period or "7d")
+    interval_s = str(interval or "15m")
+    params_key = (tuple(symbols), period_s, interval_s)
+
+    try:
+        st.session_state[MARKET_QUOTA_FLAG_KEY] = False
+    except Exception:
+        pass
+
+    force_refresh = False
+    try:
+        force_refresh = bool(st.session_state.pop(MARKET_FORCE_NEXT_KEY, False))
+    except Exception:
+        force_refresh = False
+
+    quota_low = False
+    try:
+        if ALPHA_API_KEY:
+            usage_view = compute_api_usage_display()
+            if int(usage_view.get("alpha_minute_remaining", 99)) <= 1:
+                quota_low = True
+                st.session_state[MARKET_QUOTA_FLAG_KEY] = True
+    except Exception:
+        pass
+
+    def _write_meta(source: str, age_seconds: float) -> None:
+        try:
+            st.session_state[MARKET_FETCH_META_KEY] = {
+                "source": source,
+                "age_seconds": float(age_seconds),
+                "ts": now,
+            }
+        except Exception:
+            pass
+
+    cached_data = cache.get("data")
+    cached_ts = float(cache.get("timestamp") or 0.0)
+    cached_params = cache.get("params")
+    age_from_cache_ts = max(0.0, now - cached_ts) if cached_ts > 0 else 0.0
+
+    if quota_low:
+        if (
+            cached_data is not None
+            and isinstance(cached_data, pd.DataFrame)
+            and cached_params == params_key
+            and not cached_data.empty
+        ):
+            src = "CACHE" if age_from_cache_ts < MARKET_SESSION_CACHE_TTL else "STALE_CACHE"
+            _write_meta(src, age_from_cache_ts)
+            return cached_data.copy(), src, age_from_cache_ts
+        _write_meta("FAILED", 0.0)
+        return _safe_empty_market_df(), "FAILED", 0.0
+
+    if (
+        not force_refresh
+        and cached_data is not None
+        and isinstance(cached_data, pd.DataFrame)
+        and cached_params == params_key
+        and (now - cached_ts) < MARKET_SESSION_CACHE_TTL
+    ):
+        age = max(0.0, now - cached_ts)
+        _write_meta("CACHE", age)
+        return cached_data.copy(), "CACHE", age
+
+    fresh: pd.DataFrame = _safe_empty_market_df()
+    try:
+        got = get_market_data(tuple(symbols), interval=interval_s, period=period_s)
+        if isinstance(got, pd.DataFrame):
+            fresh = got
+    except Exception as exc:
+        logger.info("get_market_data failed: %s", exc)
+        fresh = _safe_empty_market_df()
+
+    if isinstance(fresh, pd.DataFrame) and not fresh.empty:
+        cache["data"] = fresh.copy()
+        cache["timestamp"] = now
+        cache["params"] = params_key
+        _write_meta("LIVE", 0.0)
+        return fresh.copy(), "LIVE", 0.0
+
+    if cached_data is not None and isinstance(cached_data, pd.DataFrame) and cached_params == params_key and not cached_data.empty:
+        _write_meta("STALE_CACHE", age_from_cache_ts)
+        return cached_data.copy(), "STALE_CACHE", age_from_cache_ts
+
+    _write_meta("FAILED", 0.0)
+    return _safe_empty_market_df(), "FAILED", 0.0
+
+
+def _ensure_api_usage_state() -> dict[str, Any]:
+    if API_USAGE_STATE_KEY not in st.session_state:
+        now = time.time()
+        today = datetime.now().date().isoformat()
+        st.session_state[API_USAGE_STATE_KEY] = {
+            "alpha": {
+                "minute_calls": 0,
+                "day_calls": 0,
+                "last_reset_minute": now,
+                "last_reset_day": today,
+            },
+            "eodhd": {"minute_calls": 0, "last_reset_minute": now},
+        }
+    return st.session_state[API_USAGE_STATE_KEY]
+
+
+def _apply_api_usage_window_resets(usage: dict[str, Any]) -> None:
+    now = time.time()
+    today = datetime.now().date().isoformat()
+    a = usage["alpha"]
+    if now - float(a["last_reset_minute"]) >= 60.0:
+        a["minute_calls"] = 0
+        a["last_reset_minute"] = now
+    if str(a.get("last_reset_day")) != today:
+        a["day_calls"] = 0
+        a["last_reset_day"] = today
+
+    e = usage["eodhd"]
+    if now - float(e["last_reset_minute"]) >= 60.0:
+        e["minute_calls"] = 0
+        e["last_reset_minute"] = now
+
+
+def record_alpha_api_call() -> None:
+    usage = _ensure_api_usage_state()
+    _apply_api_usage_window_resets(usage)
+    usage["alpha"]["minute_calls"] += 1
+    usage["alpha"]["day_calls"] += 1
+
+
+def record_eodhd_api_calls(count: int) -> None:
+    if count <= 0:
+        return
+    usage = _ensure_api_usage_state()
+    _apply_api_usage_window_resets(usage)
+    usage["eodhd"]["minute_calls"] += int(count)
+
+
+def compute_api_usage_display() -> dict[str, Any]:
+    usage = _ensure_api_usage_state()
+    _apply_api_usage_window_resets(usage)
+    now = time.time()
+    a = usage["alpha"]
+    e = usage["eodhd"]
+    am = int(a["minute_calls"])
+    ad = int(a["day_calls"])
+    em = int(e["minute_calls"])
+
+    min_rem = ALPHA_API_MINUTE_LIMIT - am
+    day_rem = ALPHA_API_DAY_LIMIT - ad
+    e_rem = EODHD_API_MINUTE_LIMIT - em
+
+    alpha_window_elapsed = now - float(a["last_reset_minute"])
+    alpha_next_safe_sec = max(0.0, 60.0 - alpha_window_elapsed)
+    e_window_elapsed = now - float(e["last_reset_minute"])
+    eodhd_next_safe_sec = max(0.0, 60.0 - e_window_elapsed)
+
+    alpha_status = "OK"
+    if am >= ALPHA_API_MINUTE_LIMIT or ad >= ALPHA_API_DAY_LIMIT:
+        alpha_status = "BLOCKED"
+    elif min_rem <= 1 or day_rem <= 10:
+        alpha_status = "WARNING"
+
+    eodhd_status = "OK"
+    if em >= EODHD_API_MINUTE_LIMIT:
+        eodhd_status = "BLOCKED"
+    elif e_rem <= 1:
+        eodhd_status = "WARNING"
+
+    return {
+        "alpha_minute_used": am,
+        "alpha_minute_cap": ALPHA_API_MINUTE_LIMIT,
+        "alpha_minute_remaining": max(0, min_rem),
+        "alpha_day_used": ad,
+        "alpha_day_cap": ALPHA_API_DAY_LIMIT,
+        "alpha_day_remaining": max(0, day_rem),
+        "alpha_status": alpha_status,
+        "alpha_next_safe_sec": alpha_next_safe_sec,
+        "eodhd_minute_used": em,
+        "eodhd_minute_cap": EODHD_API_MINUTE_LIMIT,
+        "eodhd_minute_remaining": max(0, e_rem),
+        "eodhd_status": eodhd_status,
+        "eodhd_next_safe_sec": eodhd_next_safe_sec,
+        "alpha_refresh_blocked": alpha_status == "BLOCKED",
+        "refresh_blocked": alpha_status == "BLOCKED" or eodhd_status == "BLOCKED",
+    }
+
+
+def render_api_usage_panel() -> None:
+    if not ALPHA_API_KEY and not EODHD_API_KEY:
+        return
+    d = compute_api_usage_display()
+    st.subheader("📊 API Usage")
+
+    def _pill(label: str, status: str) -> str:
+        if status == "BLOCKED":
+            color = "#c62828"
+        elif status == "WARNING":
+            color = "#f9a825"
+        else:
+            color = "#2e7d32"
+        return f'<span style="display:inline-block;padding:2px 10px;border-radius:999px;background:{color};color:#fff;font-size:0.78rem;font-weight:700;">{label}: {status}</span>'
+
+    st.markdown(
+        f'<div style="margin-bottom:6px;">{_pill("Alpha Vantage", d["alpha_status"])} &nbsp; '
+        f'{_pill("EODHD", d["eodhd_status"])}</div>',
+        unsafe_allow_html=True,
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if ALPHA_API_KEY:
+            st.markdown("**Alpha Vantage**")
+            st.caption(
+                f"Minute: {d['alpha_minute_used']}/{d['alpha_minute_cap']} used · "
+                f"{d['alpha_minute_remaining']} remaining"
+            )
+            st.caption(
+                f"Day: {d['alpha_day_used']}/{d['alpha_day_cap']} used · {d['alpha_day_remaining']} remaining"
+            )
+            st.caption(f"Next minute-bucket reset in ~{int(np.ceil(d['alpha_next_safe_sec']))}s")
+        else:
+            st.markdown("**Alpha Vantage**")
+            st.caption("API key not configured.")
+    with c2:
+        if EODHD_API_KEY:
+            st.markdown("**EODHD**")
+            st.caption(
+                f"Minute: {d['eodhd_minute_used']}/{d['eodhd_minute_cap']} used · "
+                f"{d['eodhd_minute_remaining']} remaining (buffer limit)"
+            )
+            st.caption(f"Next minute-bucket reset in ~{int(np.ceil(d['eodhd_next_safe_sec']))}s")
+        else:
+            st.markdown("**EODHD**")
+            st.caption("API key not configured.")
+
+    if d["alpha_status"] in ("WARNING", "BLOCKED") or d["eodhd_status"] in ("WARNING", "BLOCKED"):
+        wait_candidates: list[int] = []
+        if d["alpha_status"] != "OK":
+            wait_candidates.append(int(np.ceil(d["alpha_next_safe_sec"])))
+        if d["eodhd_status"] != "OK":
+            wait_candidates.append(int(np.ceil(d["eodhd_next_safe_sec"])))
+        wait_s = max(1, max(wait_candidates) if wait_candidates else 1)
+        st.warning(f"⚠️ Avoid refreshing for **{wait_s}** seconds (API window resets).")
+
+
+def render_market_data_cache_status_bar() -> None:
+    """Market cache: frontend-only live TTL bar, colors, warning blink, reload button (no timer-driven Python reruns)."""
+    try:
+        mc = st.session_state.get("market_cache") or {}
+    except Exception:
+        mc = {}
+    last_updated = float(mc.get("timestamp") or 0.0)
+
+    try:
+        meta = st.session_state.get(MARKET_FETCH_META_KEY) or {}
+    except Exception:
+        meta = {}
+    source = str(meta.get("source", "FAILED"))
+
+    try:
+        quota_low = bool(st.session_state.get(MARKET_QUOTA_FLAG_KEY))
+    except Exception:
+        quota_low = False
+
+    ttl = int(MARKET_SESSION_CACHE_TTL)
+    lu_js = json.dumps(last_updated)
+    src_js = json.dumps(source)
+    quota_js = "true" if quota_low else "false"
+
+    st.markdown("##### Market data")
+    html_fragment = """
+<div style="font-family:sans-serif;font-size:14px;margin:4px 0 12px 0;">
+  <div id="sourceLine" style="font-weight:600;margin-bottom:6px;"></div>
+  <div id="quotaLine" style="display:none;margin-bottom:8px;color:#b8860b;"></div>
+  <div id="statusText"></div>
+  <div style="margin-top:10px;">
+    <div style="background:#eee; border-radius:10px; height:12px; overflow:hidden;">
+      <div id="progressBar" style="
+        height:12px;
+        width:100%;
+        border-radius:10px;
+        transition: width 1s linear, background-color 1s linear;
+      "></div>
+    </div>
+  </div>
+  <div id="warningText" style="margin-top:10px; font-weight:bold; min-height:1.2em;"></div>
+  <button id="refreshBtn" disabled style="
+    margin-top:10px;
+    padding:6px 12px;
+    border-radius:6px;
+    border:none;
+    background:#1976d2;
+    color:white;
+    cursor:not-allowed;
+  ">
+    🔄 Force Refresh
+  </button>
+</div>
+<script>
+(function () {
+  const TTL = """ + str(ttl) + """;
+  const lastUpdated = """ + lu_js + """;
+  const source = """ + src_js + """;
+  const quotaLow = """ + quota_js + """;
+
+  const sourceLine = document.getElementById("sourceLine");
+  const quotaLine = document.getElementById("quotaLine");
+  if (source === "LIVE") {
+    sourceLine.style.color = "#1b5e20";
+    sourceLine.innerText = "✅ Live data fetched";
+  } else if (source === "CACHE") {
+    sourceLine.style.color = "#b8860b";
+    sourceLine.innerText = "⚠️ Showing cached data (API not called)";
+  } else if (source === "STALE_CACHE") {
+    sourceLine.style.color = "#e65100";
+    sourceLine.innerText = "⚠️ API failed, showing last available data";
+  } else {
+    sourceLine.style.color = "#c62828";
+    sourceLine.innerText = "🚫 No data available";
+  }
+  if (quotaLow) {
+    quotaLine.style.display = "block";
+    quotaLine.innerText = "⚠️ API quota low, using cached data";
+  }
+
+  function getColor(percent) {
+    if (percent > 60) {
+      return "#00c853";
+    } else if (percent > 30) {
+      return "#ffd600";
+    } else {
+      return "#d50000";
+    }
+  }
+
+  const statusEl = document.getElementById("statusText");
+  const bar = document.getElementById("progressBar");
+  const warning = document.getElementById("warningText");
+  const btn = document.getElementById("refreshBtn");
+  let lastSecTick = -1;
+
+  function updateUI() {
+    const now = Date.now() / 1000;
+    let elapsed = 0;
+    if (lastUpdated > 0) {
+      elapsed = Math.max(0, now - lastUpdated);
+    }
+    let remaining = TTL - elapsed;
+    if (remaining < 0) remaining = 0;
+
+    const secTick = Math.floor(now);
+    if (secTick !== lastSecTick) {
+      lastSecTick = secTick;
+      if (lastUpdated <= 0) {
+        statusEl.innerText = "Last updated: — | Next refresh in: 0 sec";
+      } else {
+        statusEl.innerText =
+          "Last updated: " + Math.floor(elapsed) + " sec ago | Next refresh in: " + Math.floor(remaining) + " sec";
+      }
+    }
+
+    const percent = TTL > 0 ? (remaining / TTL) * 100 : 0;
+    bar.style.width = percent + "%";
+    bar.style.backgroundColor = getColor(percent);
+
+    if (remaining <= 15 && lastUpdated > 0) {
+      warning.innerText = "⚠️ Refresh available soon!";
+      warning.style.color = "red";
+      warning.style.visibility = (Math.floor(now) % 2 === 0) ? "visible" : "hidden";
+    } else {
+      warning.innerText = "";
+      warning.style.visibility = "visible";
+    }
+
+    if (remaining <= 30) {
+      btn.disabled = false;
+      btn.style.cursor = "pointer";
+      btn.style.background = "#2e7d32";
+    } else {
+      btn.disabled = true;
+      btn.style.cursor = "not-allowed";
+      btn.style.background = "#1976d2";
+    }
+  }
+
+  function loop() {
+    updateUI();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  document.getElementById("refreshBtn").onclick = function () {
+    if (document.getElementById("refreshBtn").disabled) return;
+    const target = window.parent && window.parent !== window ? window.parent : window;
+    target.location.reload();
+  };
+})();
+</script>
+"""
+    components.html(html_fragment, height=260, scrolling=False)
 
 
 def _yahoo_rate_limit_wait() -> None:
@@ -803,52 +1253,206 @@ def _nse_numeric_field(row: dict[str, Any], *names: str) -> float:
     return 0.0
 
 
+NSE_INSIDER_NET_THRESHOLD = 1.0  # min |net| to classify BUYING/SELLING vs NEUTRAL
+
+
+def _nse_empty_insider_detail() -> dict[str, Any]:
+    return {
+        "activity": "NO_DATA",
+        "net_qty": None,
+        "last_date": "—",
+        "interpretation": "No recent promoter disclosures",
+    }
+
+
+def _nse_is_promoter_or_promoter_group_category(category: str) -> bool:
+    u = str(category or "").strip().upper()
+    if not u:
+        return False
+    if u == "PROMOTER":
+        return True
+    if u == "PROMOTER GROUP" or "PROMOTER GROUP" in u:
+        return True
+    return False
+
+
+def _nse_row_trade_date(row: dict[str, Any]) -> datetime | None:
+    for key in (
+        "date",
+        "tradeDate",
+        "acqfromDt",
+        "acquisitionDateFrom",
+        "pefromDate",
+        "transactionDate",
+        "disclosureDate",
+        "acqFromDate",
+    ):
+        raw = row.get(key) or row.get(key.lower() if key != key.lower() else key)
+        if raw in (None, "", "-"):
+            continue
+        try:
+            dt = pd.to_datetime(raw, errors="coerce")
+            if pd.isna(dt):
+                continue
+            return dt.to_pydatetime()
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _nse_underlying_symbol(row: dict[str, Any]) -> str | None:
+    sym_raw = row.get("symbol") or row.get("sym") or row.get("tradingSymbol") or row.get("company")
+    return clean_underlying_symbol(sym_raw)
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_nse_promoter_net_by_symbol() -> dict[str, float]:
+def fetch_nse_promoter_insider_details_by_symbol(candidate_symbols: tuple[str, ...]) -> dict[str, dict[str, Any]]:
     """
-    Single cached call to NSE corporates PIT (equities). Returns underlying symbol -> net promoter qty (buy - sell).
-    On failure returns {} (caller maps to NO_DATA).
+    Single NSE corporates-pit call per cache window (~1 day). Aggregates secAcq/secSale for
+    Promoter + Promoter Group only, last 10 calendar days, for the requested underlying symbols.
     """
+    want = {str(s).strip().upper() for s in candidate_symbols if str(s).strip()}
+    out: dict[str, dict[str, Any]] = {s: _nse_empty_insider_detail() for s in want}
+    if not want:
+        return out
+
     try:
         cookie_jar = http.cookiejar.CookieJar()
         opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
         opener.addheaders = [(key, value) for key, value in NSE_BROWSER_HEADERS.items()]
-
         opener.open(urllib.request.Request("https://www.nseindia.com/"), timeout=12).read()
-
         api_url = "https://www.nseindia.com/api/corporates-pit?index=equities"
-        with opener.open(urllib.request.Request(api_url), timeout=20) as response:
+        with opener.open(urllib.request.Request(api_url), timeout=25) as response:
             raw = response.read().decode("utf-8", errors="replace")
         payload = json.loads(raw)
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
         logger.info("NSE corporates-pit fetch failed: %s", exc)
-        return {}
+        return out
     except Exception as exc:
         logger.exception("Unexpected NSE corporates-pit error: %s", exc)
-        return {}
+        return out
 
     records = _nse_corporates_pit_records(payload)
     if not records:
-        return {}
+        return out
 
-    net_by_symbol: dict[str, float] = {}
+    cutoff = datetime.now() - timedelta(days=10)
+    agg_net: dict[str, float] = {s: 0.0 for s in want}
+    agg_last: dict[str, datetime] = {}
+    touched: set[str] = set()
+
     for row in records:
-        category = str(row.get("personCategory") or row.get("personcategory") or "").strip().upper()
-        if not category:
+        if not isinstance(row, dict):
             continue
-        if "PROMOTER" not in category:
-            continue
-
-        sym_raw = row.get("symbol") or row.get("sym") or row.get("tradingSymbol") or row.get("company")
-        sym = clean_underlying_symbol(sym_raw)
-        if not sym:
+        cat = str(row.get("personCategory") or row.get("personcategory") or "")
+        if not _nse_is_promoter_or_promoter_group_category(cat):
             continue
 
-        buy_qty = _nse_numeric_field(row, "buyQuantity", "buyquantity", "buyQty", "buyqty")
-        sell_qty = _nse_numeric_field(row, "sellQuantity", "sellquantity", "sellQty", "sellqty")
-        net_by_symbol[sym] = net_by_symbol.get(sym, 0.0) + (buy_qty - sell_qty)
+        sym = _nse_underlying_symbol(row)
+        if not sym or sym.upper() not in want:
+            continue
 
-    return net_by_symbol
+        dt = _nse_row_trade_date(row)
+        if dt is not None and dt < cutoff:
+            continue
+
+        sym_u = sym.upper()
+        touched.add(sym_u)
+
+        buy_qty = _nse_numeric_field(
+            row,
+            "secAcq",
+            "secacq",
+            "secAcqQty",
+            "buyQuantity",
+            "buyquantity",
+            "buyQty",
+            "buyqty",
+        )
+        sell_qty = _nse_numeric_field(
+            row,
+            "secSale",
+            "secsale",
+            "secSaleQty",
+            "sellQuantity",
+            "sellquantity",
+            "sellQty",
+            "sellqty",
+        )
+        agg_net[sym_u] = agg_net.get(sym_u, 0.0) + (buy_qty - sell_qty)
+        if dt is not None:
+            prev = agg_last.get(sym_u)
+            if prev is None or dt > prev:
+                agg_last[sym_u] = dt
+
+    for sym_u in want:
+        if sym_u not in touched:
+            out[sym_u] = _nse_empty_insider_detail()
+            continue
+
+        net = float(agg_net.get(sym_u, 0.0))
+        last_dt = agg_last.get(sym_u)
+        last_s = last_dt.strftime("%Y-%m-%d") if last_dt is not None else "—"
+
+        if net > NSE_INSIDER_NET_THRESHOLD:
+            act = "BUYING"
+            interp = "Promoters have increased stake recently (positive long-term signal)"
+        elif net < -NSE_INSIDER_NET_THRESHOLD:
+            act = "SELLING"
+            interp = "Promoters have reduced stake (use caution, not necessarily bearish short-term)"
+        else:
+            act = "NEUTRAL"
+            interp = "No significant promoter activity"
+
+        out[sym_u] = {
+            "activity": act,
+            "net_qty": net,
+            "last_date": last_s,
+            "interpretation": interp,
+        }
+
+    return out
+
+
+def gather_nse_insider_candidate_symbols(signals: pd.DataFrame, active_history: pd.DataFrame) -> set[str]:
+    """STRONG + WEAK signals and ACTIVE DB trades only (no EARLY)."""
+    out: set[str] = set()
+    if not signals.empty:
+        strong_weak = {"STRONG_LONG", "STRONG_SHORT", "WEAK_LONG", "WEAK_SHORT"}
+        for _, row in signals.iterrows():
+            if str(row.get("Signal", "")) in strong_weak:
+                sym = clean_underlying_symbol(row.get("Stock")) or ""
+                if sym:
+                    out.add(sym.upper())
+    if not active_history.empty and "stock" in active_history.columns:
+        for sym in active_history["stock"].tolist():
+            s = clean_underlying_symbol(sym) or ""
+            if s:
+                out.add(s.upper())
+    return out
+
+
+def refresh_nse_insider_context(signals: pd.DataFrame, active_history: pd.DataFrame, use_sample_data: bool) -> None:
+    """Populate session insider map for details panel only; does not mutate signals or scores."""
+    if use_sample_data:
+        st.session_state["_nse_insider_by_symbol"] = {}
+        return
+    candidates = gather_nse_insider_candidate_symbols(signals, active_history)
+    if not candidates:
+        st.session_state["_nse_insider_by_symbol"] = {}
+        return
+    key = tuple(sorted(candidates))
+    st.session_state["_nse_insider_by_symbol"] = fetch_nse_promoter_insider_details_by_symbol(key)
+
+
+def insider_detail_for_stock(stock: object) -> dict[str, Any]:
+    sym = clean_underlying_symbol(stock) or ""
+    if not sym:
+        return _nse_empty_insider_detail()
+    bag = st.session_state.get("_nse_insider_by_symbol") or {}
+    if isinstance(bag, dict) and sym.upper() in bag:
+        return dict(bag[sym.upper()])
+    return _nse_empty_insider_detail()
 
 
 def strategy_type_label(signal_type: str) -> str:
@@ -965,85 +1569,6 @@ def build_explainability(
         "failed_conditions": failed,
         "trade_quality": trade_quality_label(signal, failed),
     }
-
-
-def merge_promoter_activity_and_adjust_confidence(
-    signals: pd.DataFrame,
-    active_history: pd.DataFrame,
-    use_sample_data: bool,
-) -> pd.DataFrame:
-    if signals.empty:
-        return signals
-
-    df = signals.copy()
-    if "promoter_activity" not in df.columns:
-        df["promoter_activity"] = "NO_DATA"
-
-    candidate_symbols: set[str] = set()
-    for _, row in df.iterrows():
-        sig = str(row.get("Signal", ""))
-        if sig in {"STRONG_LONG", "STRONG_SHORT", "WEAK_LONG", "WEAK_SHORT"}:
-            sym = clean_underlying_symbol(row.get("Stock")) or ""
-            if sym:
-                candidate_symbols.add(sym.upper())
-
-    if not active_history.empty and "stock" in active_history.columns:
-        for sym in active_history["stock"].tolist():
-            cleaned = clean_underlying_symbol(sym) or ""
-            if cleaned:
-                candidate_symbols.add(cleaned.upper())
-
-    if use_sample_data or not candidate_symbols:
-        df["promoter_activity"] = "NO_DATA"
-        return df
-
-    net_map = fetch_nse_promoter_net_by_symbol()
-
-    def classify_promoter(net: float) -> str:
-        if net > 0:
-            return "BUYING"
-        if net < 0:
-            return "SELLING"
-        if net == 0:
-            return "NEUTRAL"
-        return "NO_DATA"
-
-    promoter_labels: list[str] = []
-    for _, row in df.iterrows():
-        sym = clean_underlying_symbol(row.get("Stock")) or ""
-        sym_u = sym.upper()
-        if sym_u not in candidate_symbols:
-            promoter_labels.append("NO_DATA")
-            continue
-        net = net_map.get(sym_u)
-        if net is None:
-            promoter_labels.append("NO_DATA")
-        else:
-            promoter_labels.append(classify_promoter(float(net)))
-
-    df["promoter_activity"] = promoter_labels
-
-    adjusted_scores: list[int] = []
-    for _, row in df.iterrows():
-        score = int(pd.to_numeric(row.get("Confidence Score"), errors="coerce") or 0)
-        sig = str(row.get("Signal", ""))
-        promo = str(row.get("promoter_activity", "NO_DATA"))
-        direction = signal_direction(sig)
-
-        if is_trade_signal(sig) and promo not in {"", "NO_DATA"}:
-            if direction == "LONG" and promo == "BUYING":
-                score += 1
-            elif direction == "SHORT" and promo == "SELLING":
-                score += 1
-            elif direction == "LONG" and promo == "SELLING":
-                score -= 1
-            elif direction == "SHORT" and promo == "BUYING":
-                score -= 1
-
-        adjusted_scores.append(int(max(0, min(5, score))))
-
-    df["Confidence Score"] = adjusted_scores
-    return df
 
 
 def make_sample_history(symbol: str, periods: int = 180) -> pd.DataFrame:
@@ -2304,7 +2829,6 @@ def evaluate_symbol(
         "Distance from EMA20 %": distance_from_ema20 * 100,
         "Confidence Score": score,
         "Trade Quality": explain["trade_quality"],
-        "promoter_activity": "NO_DATA",
         "trend_direction": explain["trend_direction"],
         "ema_condition": explain["ema_condition"],
         "rsi_value": explain["rsi_value"],
@@ -2358,6 +2882,7 @@ def scan_symbols(
     period: str = "30d",
     interval: str = "1h",
     use_sample_data: bool = False,
+    market_refresh_nonce: int = 0,
 ) -> tuple[pd.DataFrame, list[str]]:
     if not symbols:
         return empty_futures_table(), ["No symbols available to scan"]
@@ -2903,7 +3428,16 @@ def render_trade_explain_body(row: pd.Series) -> None:
         f"**Distance from EMA20:** {float(row.get('distance_from_ema', 0) or 0) * 100:.2f}% — {row.get('distance_condition', '—')}"
     )
     st.markdown(f"**Strategy:** {row.get('strategy_type', '—')}")
-    st.markdown(f"**Promoter activity:** {row.get('promoter_activity', 'NO_DATA')}")
+    ins = insider_detail_for_stock(row.get("Stock"))
+    st.markdown("**Insider Activity (NSE):**")
+    st.markdown(f"- **Promoter activity:** {ins.get('activity', 'NO_DATA')}")
+    nq = ins.get("net_qty")
+    if nq is not None and isinstance(nq, (int, float)) and not (isinstance(nq, float) and np.isnan(nq)):
+        st.markdown(f"- **Net quantity (10d, promoter / promoter group):** {nq:,.0f}")
+    else:
+        st.markdown("- **Net quantity (10d):** —")
+    st.markdown(f"- **Last transaction date:** {ins.get('last_date', '—')}")
+    st.caption(str(ins.get("interpretation", "")))
     st.markdown(
         f"**Confidence:** {int(row.get('Confidence Score', 0) or 0)}/5 · **Quality:** {row.get('Trade Quality', '—')}"
     )
@@ -2933,7 +3467,6 @@ def render_trade_cards(data: pd.DataFrame, side: str) -> None:
         for pos, (column, (_, row)) in enumerate(zip(columns, chunk.iterrows())):
             direction = signal_direction(str(row["Signal"]))
             card_class = "long-card" if direction == "LONG" else "short-card"
-            promoter = str(row.get("promoter_activity", "NO_DATA") or "NO_DATA")
             quality = str(row.get("Trade Quality", "—") or "—")
 
             with column:
@@ -2947,7 +3480,6 @@ def render_trade_cards(data: pd.DataFrame, side: str) -> None:
                             <div class="card-line">SL <strong>{row["Stop Loss"]:,.2f}</strong></div>
                             <div class="card-line">Target <strong>{row["Target"]:,.2f}</strong></div>
                             <div class="card-score">Conf {int(row["Confidence Score"])}/5 · {signal_strength(str(row["Signal"]))}</div>
-                            <div class="card-line">Promoter <strong>{promoter}</strong></div>
                             <div class="card-line">Quality <strong>{quality}</strong></div>
                         </div>
                         """,
@@ -3095,8 +3627,21 @@ def render_sidebar(fno_symbols: list[str], option_symbols: list[str]) -> tuple[l
         atr_multiplier = st.slider("ATR multiplier", 0.5, 4.0, 1.5, 0.25)
         target_rr = st.slider("Target RR", 1.0, 5.0, 2.0, 0.5)
 
-        if st.button("Refresh", type="primary", use_container_width=True):
+        _usage_sidebar = compute_api_usage_display()
+        _refresh_blocked = bool(_usage_sidebar.get("refresh_blocked"))
+
+        if st.button(
+            "Refresh",
+            type="primary",
+            use_container_width=True,
+            disabled=_refresh_blocked,
+            help="Disabled when Alpha Vantage or EODHD per-minute quota is exhausted.",
+        ):
             clear_market_data_cache()
+            try:
+                st.session_state[MARKET_SCAN_NONCE_KEY] = int(st.session_state.get(MARKET_SCAN_NONCE_KEY, 0)) + 1
+            except Exception:
+                pass
             load_stock_list.clear()
             load_option_list.clear()
             st.rerun()
@@ -3197,7 +3742,6 @@ def render_top_trade_highlight(signals: pd.DataFrame) -> None:
     direction_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
     card_class = "" if direction == "LONG" else "short"
     score = int(pd.to_numeric(top.get("Confidence Score"), errors="coerce") or 0)
-    promoter = str(top.get("promoter_activity", "NO_DATA") or "NO_DATA")
 
     st.markdown(
         f"""
@@ -3207,7 +3751,6 @@ def render_top_trade_highlight(signals: pd.DataFrame) -> None:
             <div class="top-trade-line">Entry: <strong>{float(top["Entry"]):,.2f}</strong></div>
             <div class="top-trade-line">SL: <strong>{float(top["Stop Loss"]):,.2f}</strong></div>
             <div class="top-trade-line">Target: <strong>{float(top["Target"]):,.2f}</strong></div>
-            <div class="top-trade-line">Promoter: <strong>{promoter}</strong></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -3295,6 +3838,12 @@ def main() -> None:
 
     st.subheader("📊 Trading Dashboard")
     last_updated = datetime.now().strftime("%d %b %Y, %H:%M:%S")
+    try:
+        if MARKET_SCAN_NONCE_KEY not in st.session_state:
+            st.session_state[MARKET_SCAN_NONCE_KEY] = 0
+    except Exception:
+        pass
+    render_api_usage_panel()
 
     if fno_error:
         st.warning(fno_error)
@@ -3311,14 +3860,17 @@ def main() -> None:
             period=period,
             interval=interval,
             use_sample_data=use_sample_data,
+            market_refresh_nonce=int(st.session_state.get(MARKET_SCAN_NONCE_KEY, 0)),
         )
+
+    render_market_data_cache_status_bar()
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
         with get_db_connection() as connection:
             init_db(connection)
             active_history = get_active_trades(connection)
-            signals = merge_promoter_activity_and_adjust_confidence(signals, active_history, use_sample_data)
+            refresh_nse_insider_context(signals, active_history, use_sample_data)
             if not signals.empty:
                 signals = sort_futures_table(signals)
             process_exits(connection, signals)
@@ -3333,7 +3885,7 @@ def main() -> None:
         active_history = empty_history_table()
         closed_history = empty_history_table()
         performance_metrics = default_performance_metrics()
-        signals = merge_promoter_activity_and_adjust_confidence(signals, active_history, use_sample_data)
+        refresh_nse_insider_context(signals, active_history, use_sample_data)
         if not signals.empty:
             signals = sort_futures_table(signals)
 
