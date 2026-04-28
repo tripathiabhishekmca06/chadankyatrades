@@ -6,8 +6,10 @@ import logging
 import os
 import re
 import sqlite3
+import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -15,8 +17,10 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 
+from settings import get_alpha_vantage_api_key, get_eodhd_api_key
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
@@ -135,6 +139,18 @@ SIGNAL_PRIORITY = {
     "WEAK_SHORT": 3,
     "WAIT": 4,
 }
+
+CACHE_TTL = 60
+ALPHA_API_KEY = get_alpha_vantage_api_key()
+EODHD_API_KEY = get_eodhd_api_key()
+# EODHD intraday is one symbol per request; use parallel workers + Session to cut wall time.
+EODHD_FALLBACK_MAX_WORKERS = 4
+YAHOO_FETCH_CACHE_TTL_SECONDS = CACHE_TTL
+YAHOO_MIN_CALL_GAP_SECONDS = 2.0
+_YAHOO_FETCH_CACHE: dict[tuple[Any, ...], tuple[float, pd.DataFrame]] = {}
+_YAHOO_LAST_CALL_TS = 0.0
+_ALPHA_LAST_CALL_TS = 0.0
+_EODHD_LAST_CALL_TS = 0.0
 
 SYMBOL_COLUMN_CANDIDATES = (
     "symbol",
@@ -378,8 +394,149 @@ def to_yahoo_symbol(symbol: str) -> str:
     return symbol.upper() if symbol.upper().endswith(".NS") else f"{symbol.upper()}.NS"
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def download_market_data(symbols: tuple[str, ...], period: str, interval: str) -> pd.DataFrame:
+def _normalize_ohlcv_frame(data: pd.DataFrame) -> pd.DataFrame:
+    if data.empty:
+        return pd.DataFrame(columns=OHLCV_COLUMNS)
+    frame = data.copy()
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = frame.columns.get_level_values(-1)
+    frame = frame.rename(columns=str.title)
+    if "Adj Close" in frame.columns and "Close" not in frame.columns:
+        frame["Close"] = frame["Adj Close"]
+    for col in OHLCV_COLUMNS:
+        if col not in frame.columns:
+            frame[col] = np.nan
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    frame = frame[OHLCV_COLUMNS].dropna(subset=["Open", "High", "Low", "Close"])
+    return frame.sort_index()
+
+
+def _extract_yahoo_symbol_frame(payload: pd.DataFrame, ticker: str, total: int) -> pd.DataFrame:
+    if payload.empty:
+        return pd.DataFrame(columns=OHLCV_COLUMNS)
+    if total == 1 and not isinstance(payload.columns, pd.MultiIndex):
+        return _normalize_ohlcv_frame(payload)
+    if isinstance(payload.columns, pd.MultiIndex) and ticker in payload.columns.get_level_values(0):
+        return _normalize_ohlcv_frame(payload[ticker])
+    return pd.DataFrame(columns=OHLCV_COLUMNS)
+
+
+def _to_alpha_symbol(yahoo_symbol: str) -> str:
+    return clean_underlying_symbol(yahoo_symbol) or yahoo_symbol.replace(".NS", "")
+
+
+def _to_eodhd_symbol(yahoo_symbol: str) -> str:
+    base = clean_underlying_symbol(yahoo_symbol) or yahoo_symbol.replace(".NS", "")
+    return f"{base}.NSE"
+
+
+def _alpha_wait() -> None:
+    global _ALPHA_LAST_CALL_TS
+    now = time.monotonic()
+    wait_for = 12.0 - (now - _ALPHA_LAST_CALL_TS)
+    if wait_for > 0:
+        time.sleep(wait_for)
+    _ALPHA_LAST_CALL_TS = time.monotonic()
+
+
+def _eodhd_wait() -> None:
+    global _EODHD_LAST_CALL_TS
+    now = time.monotonic()
+    wait_for = 1.0 - (now - _EODHD_LAST_CALL_TS)
+    if wait_for > 0:
+        time.sleep(wait_for)
+    _EODHD_LAST_CALL_TS = time.monotonic()
+
+
+def _fetch_alpha_intraday(yahoo_symbol: str, session: requests.Session | None = None) -> pd.DataFrame:
+    if not ALPHA_API_KEY:
+        return pd.DataFrame(columns=OHLCV_COLUMNS)
+    _alpha_wait()
+    params = {
+        "function": "TIME_SERIES_INTRADAY",
+        "symbol": _to_alpha_symbol(yahoo_symbol),
+        "interval": "15min",
+        "outputsize": "compact",
+        "apikey": ALPHA_API_KEY,
+    }
+    sess = session if session is not None else requests
+    response = sess.get("https://www.alphavantage.co/query", params=params, timeout=20)
+    payload = response.json() if response.ok else {}
+    series = payload.get("Time Series (15min)")
+    if not isinstance(series, dict) or not series:
+        return pd.DataFrame(columns=OHLCV_COLUMNS)
+    rows = pd.DataFrame.from_dict(series, orient="index")
+    rows.index = pd.to_datetime(rows.index, errors="coerce")
+    rows = rows.rename(
+        columns={
+            "1. open": "Open",
+            "2. high": "High",
+            "3. low": "Low",
+            "4. close": "Close",
+            "5. volume": "Volume",
+        }
+    )
+    return _normalize_ohlcv_frame(rows)
+
+
+def _fetch_eodhd_intraday_or_daily(
+    yahoo_symbol: str,
+    session: requests.Session | None = None,
+    throttle: bool = True,
+) -> pd.DataFrame:
+    if not EODHD_API_KEY:
+        return pd.DataFrame(columns=OHLCV_COLUMNS)
+    eod_symbol = _to_eodhd_symbol(yahoo_symbol)
+    sess = session if session is not None else requests
+
+    if throttle:
+        _eodhd_wait()
+    intraday_url = f"https://eodhd.com/api/intraday/{eod_symbol}"
+    intraday_params = {"api_token": EODHD_API_KEY, "interval": "15m", "fmt": "json"}
+    intraday_resp = sess.get(intraday_url, params=intraday_params, timeout=20)
+    if intraday_resp.ok:
+        payload = intraday_resp.json()
+        if isinstance(payload, list) and payload:
+            rows = pd.DataFrame(payload)
+            rows["Datetime"] = pd.to_datetime(rows.get("datetime"), errors="coerce")
+            rows = rows.set_index("Datetime").rename(
+                columns={
+                    "open": "Open",
+                    "high": "High",
+                    "low": "Low",
+                    "close": "Close",
+                    "volume": "Volume",
+                }
+            )
+            frame = _normalize_ohlcv_frame(rows)
+            if not frame.empty:
+                return frame
+
+    if throttle:
+        _eodhd_wait()
+    daily_url = f"https://eodhd.com/api/eod/{eod_symbol}"
+    daily_params = {"api_token": EODHD_API_KEY, "period": "d", "fmt": "json"}
+    daily_resp = sess.get(daily_url, params=daily_params, timeout=20)
+    if not daily_resp.ok:
+        return pd.DataFrame(columns=OHLCV_COLUMNS)
+    payload = daily_resp.json()
+    if not isinstance(payload, list) or not payload:
+        return pd.DataFrame(columns=OHLCV_COLUMNS)
+    rows = pd.DataFrame(payload)
+    rows["Datetime"] = pd.to_datetime(rows.get("date"), errors="coerce")
+    rows = rows.set_index("Datetime").rename(
+        columns={
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        }
+    )
+    return _normalize_ohlcv_frame(rows)
+
+
+def get_market_data(symbols: tuple[str, ...], interval: str = "15m", period: str = "7d") -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame()
 
@@ -388,50 +545,183 @@ def download_market_data(symbols: tuple[str, ...], period: str, interval: str) -
     except ImportError as exc:
         raise RuntimeError("yfinance is not installed. Run pip install -r requirements.txt") from exc
 
-    tickers = [to_yahoo_symbol(symbol) for symbol in symbols]
+    tickers = tuple(to_yahoo_symbol(symbol) for symbol in symbols)
+    cache_key = ("multi_source_market_data", tickers, interval, period)
+    cached = _yahoo_cache_get(cache_key)
+    if cached is not None:
+        print("Cache used")
+        return cached
+
+    _yahoo_rate_limit_wait()
+    yahoo_payload = pd.DataFrame()
     try:
-        data = yf.download(
-            tickers=tickers,
-            period=period,
+        yahoo_payload = yf.download(
+            tickers=list(tickers),
             interval=interval,
+            period=period,
             auto_adjust=False,
             group_by="ticker",
             progress=False,
             threads=True,
         )
     except Exception as exc:
-        raise RuntimeError(f"Yahoo Finance request failed: {exc}") from exc
+        logger.info("Yahoo batch fetch failed: %s", exc)
 
-    if data.empty:
-        raise RuntimeError("No data returned from Yahoo Finance")
+    frames_by_ticker: dict[str, pd.DataFrame] = {}
+    missing: list[str] = []
+    for ticker in tickers:
+        frame = _extract_yahoo_symbol_frame(yahoo_payload, ticker, len(tickers))
+        if frame.empty:
+            missing.append(ticker)
+        else:
+            frames_by_ticker[ticker] = frame
 
-    if isinstance(data, pd.DataFrame) and data.dropna(how="all").empty:
-        raise RuntimeError("Yahoo Finance returned only empty rows")
+    yahoo_success_count = len(frames_by_ticker)
+    alpha_fallback_count = 0
+    eodhd_fallback_count = 0
 
-    return data
+    # Yahoo: yf.download is already multi-ticker. Alpha Vantage TIME_SERIES_INTRADAY is one symbol
+    # per request (no official batch for NSE intraday). EODHD intraday is per symbol; we use a
+    # shared Session plus limited parallel workers for the EODHD fallback to reduce wall time.
+
+    with requests.Session() as http_session:
+        still_missing: list[str] = []
+        for ticker in missing:
+            try:
+                frame = _fetch_alpha_intraday(ticker, http_session)
+            except Exception as exc:
+                logger.info("Alpha Vantage fetch failed for %s: %s", ticker, exc)
+                frame = pd.DataFrame(columns=OHLCV_COLUMNS)
+            if frame.empty:
+                still_missing.append(ticker)
+            else:
+                frames_by_ticker[ticker] = frame
+                alpha_fallback_count += 1
+
+        def _eodhd_one(ticker: str) -> tuple[str, pd.DataFrame]:
+            try:
+                return ticker, _fetch_eodhd_intraday_or_daily(
+                    ticker, session=http_session, throttle=False
+                )
+            except Exception as exc:
+                logger.info("EODHD fetch failed for %s: %s", ticker, exc)
+                return ticker, pd.DataFrame(columns=OHLCV_COLUMNS)
+
+        if still_missing:
+            max_workers = min(EODHD_FALLBACK_MAX_WORKERS, len(still_missing))
+            if max_workers <= 1:
+                eod_results = [_eodhd_one(t) for t in still_missing]
+            else:
+                eod_results = []
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_map = {executor.submit(_eodhd_one, t): t for t in still_missing}
+                    for fut in as_completed(future_map):
+                        try:
+                            eod_results.append(fut.result())
+                        except Exception as exc:
+                            t_failed = future_map[fut]
+                            logger.info("EODHD worker failed for %s: %s", t_failed, exc)
+                            eod_results.append((t_failed, pd.DataFrame(columns=OHLCV_COLUMNS)))
+            for ticker, frame in eod_results:
+                if frame.empty:
+                    continue
+                frames_by_ticker[ticker] = frame
+                eodhd_fallback_count += 1
+
+    print(f"Yahoo success count: {yahoo_success_count}")
+    print(f"Alpha fallback count: {alpha_fallback_count}")
+    print(f"EODHD fallback count: {eodhd_fallback_count}")
+
+    if not frames_by_ticker:
+        return pd.DataFrame()
+
+    merged = pd.concat(frames_by_ticker, axis=1, sort=True).sort_index()
+    _yahoo_cache_set(cache_key, merged)
+    return merged
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+def download_market_data(symbols: tuple[str, ...], period: str, interval: str) -> pd.DataFrame:
+    return get_market_data(symbols, interval=interval or "15m", period=period or "7d")
+
+
 def fetch_index_data(symbol: str = "^NSEI", period: str = "1y", interval: str = "1d") -> pd.DataFrame:
     try:
         import yfinance as yf
     except ImportError as exc:
         raise RuntimeError("yfinance is not installed. Run pip install -r requirements.txt") from exc
 
-    try:
-        data = yf.download(
-            tickers=symbol,
-            period=period,
-            interval=interval,
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-        )
-    except Exception as exc:
-        raise RuntimeError(f"Index request failed for {symbol}: {exc}") from exc
+    ticker = to_yahoo_symbol(symbol) if not str(symbol).startswith("^") else symbol
+    cache_key = ("index", ticker, period, interval)
+    cached = _yahoo_cache_get(cache_key)
+    if cached is not None:
+        print("Cache used")
+        data = cached
+    else:
+        def _fetch(use_proxy: bool) -> pd.DataFrame:
+            _yahoo_rate_limit_wait()
+            if use_proxy:
+                print("Proxy fallback")
+                return yf.download(
+                    tickers=ticker,
+                    period=period,
+                    interval=interval,
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False,
+                )
 
-    if data.empty:
-        raise RuntimeError(f"No data returned from Yahoo Finance for {symbol}")
+            print("Direct fetch")
+            proxy_keys = (
+                "http_proxy",
+                "https_proxy",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "all_proxy",
+                "ALL_PROXY",
+                "socks_proxy",
+                "SOCKS_PROXY",
+                "socks5_proxy",
+                "SOCKS5_PROXY",
+                "GIT_HTTP_PROXY",
+                "GIT_HTTPS_PROXY",
+            )
+            previous_env: dict[str, str] = {}
+            try:
+                for key in proxy_keys:
+                    value = os.environ.pop(key, None)
+                    if value is not None:
+                        previous_env[key] = value
+                return yf.download(
+                    tickers=ticker,
+                    period=period,
+                    interval=interval,
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False,
+                )
+            finally:
+                for key, value in previous_env.items():
+                    os.environ[key] = value
+
+        direct_error: Exception | None = None
+        data = pd.DataFrame()
+        try:
+            data = _fetch(use_proxy=False)
+        except Exception as exc:
+            direct_error = exc
+
+        if (data.empty or data.dropna(how="all").empty) and direct_error is not None and _is_http_429_error(direct_error):
+            try:
+                data = _fetch(use_proxy=True)
+            except Exception as exc:
+                logger.info("Yahoo index proxy fallback failed for %s: %s", symbol, exc)
+
+        if data.empty:
+            if direct_error is not None:
+                logger.info("Yahoo index direct fetch failed for %s: %s", symbol, direct_error)
+            raise RuntimeError(f"No data returned from Yahoo Finance for {symbol}")
+
+        _yahoo_cache_set(cache_key, data)
 
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
@@ -449,6 +739,43 @@ def fetch_index_data(symbol: str = "^NSEI", period: str = "1y", interval: str = 
     if cleaned.empty:
         raise RuntimeError(f"Index response had no valid OHLC rows for {symbol}")
     return cleaned
+
+
+def _yahoo_cache_get(key: tuple[Any, ...]) -> pd.DataFrame | None:
+    entry = _YAHOO_FETCH_CACHE.get(key)
+    if not entry:
+        return None
+    ts, value = entry
+    if (time.time() - ts) > YAHOO_FETCH_CACHE_TTL_SECONDS:
+        _YAHOO_FETCH_CACHE.pop(key, None)
+        return None
+    return value.copy()
+
+
+def _yahoo_cache_set(key: tuple[Any, ...], value: pd.DataFrame) -> None:
+    _YAHOO_FETCH_CACHE[key] = (time.time(), value.copy())
+
+
+def clear_market_data_cache() -> None:
+    global _YAHOO_LAST_CALL_TS, _ALPHA_LAST_CALL_TS, _EODHD_LAST_CALL_TS
+    _YAHOO_FETCH_CACHE.clear()
+    _YAHOO_LAST_CALL_TS = 0.0
+    _ALPHA_LAST_CALL_TS = 0.0
+    _EODHD_LAST_CALL_TS = 0.0
+
+
+def _yahoo_rate_limit_wait() -> None:
+    global _YAHOO_LAST_CALL_TS
+    now = time.monotonic()
+    elapsed = now - _YAHOO_LAST_CALL_TS
+    if elapsed < YAHOO_MIN_CALL_GAP_SECONDS:
+        time.sleep(YAHOO_MIN_CALL_GAP_SECONDS - elapsed)
+    _YAHOO_LAST_CALL_TS = time.monotonic()
+
+
+def _is_http_429_error(exc: Exception) -> bool:
+    message = str(exc)
+    return "429" in message or "Too Many Requests" in message
 
 
 def _nse_corporates_pit_records(payload: Any) -> list[dict[str, Any]]:
@@ -746,7 +1073,7 @@ def extract_symbol_history(market_data: pd.DataFrame, symbol: str, total_symbols
     elif isinstance(market_data.columns, pd.MultiIndex) and symbol in market_data.columns.get_level_values(0):
         data = market_data[symbol].copy()
     else:
-        raise ValueError("No price data returned")
+        return pd.DataFrame(columns=OHLCV_COLUMNS)
 
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(-1)
@@ -754,7 +1081,8 @@ def extract_symbol_history(market_data: pd.DataFrame, symbol: str, total_symbols
     data = data.rename(columns=str.title)
     missing_columns = [column for column in OHLCV_COLUMNS if column not in data.columns]
     if missing_columns:
-        raise ValueError(f"Missing columns: {', '.join(missing_columns)}")
+        logger.info("Skipping %s: missing columns in source payload (%s)", symbol, ", ".join(missing_columns))
+        return pd.DataFrame(columns=OHLCV_COLUMNS)
 
     data = data[OHLCV_COLUMNS].copy()
     for column in OHLCV_COLUMNS:
@@ -847,11 +1175,13 @@ def classify_index_trend(data: pd.DataFrame, config: StrategyConfig) -> tuple[st
     ema20 = float(latest["EMA20"])
     ema50 = float(latest["EMA50"])
     rsi = float(latest["RSI"])
-    adx = float(latest["ADX"])
+    adx_raw = pd.to_numeric(latest.get("ADX"), errors="coerce")
+    adx = float(adx_raw) if pd.notna(adx_raw) else np.nan
 
-    bullish = ema20 > ema50 and adx > 20 and rsi > 55
-    bearish = ema20 < ema50 and adx > 20 and rsi < 45
-    sideways = adx < 20
+    adx_confirmed = adx > 20 if np.isfinite(adx) else True
+    bullish = ema20 > ema50 and adx_confirmed and rsi > 55
+    bearish = ema20 < ema50 and adx_confirmed and rsi < 45
+    sideways = adx < 20 if np.isfinite(adx) else 45 <= rsi <= 55
 
     if bullish:
         trend = "BULLISH"
@@ -865,13 +1195,75 @@ def classify_index_trend(data: pd.DataFrame, config: StrategyConfig) -> tuple[st
     return trend, adx, rsi
 
 
+def _fetch_regime_history(symbol: str) -> pd.DataFrame:
+    yahoo_symbol = to_yahoo_symbol(symbol)
+    payload = get_market_data((symbol,), interval="15m", period="7d")
+    return _extract_yahoo_symbol_frame(payload, yahoo_symbol, total=1)
+
+
+def _trend_score(trend: str) -> int:
+    if trend == "BULLISH":
+        return 1
+    if trend == "BEARISH":
+        return -1
+    return 0
+
+
+def _score_to_trend(score: float) -> str:
+    if score > 0.2:
+        return "BULLISH"
+    if score < -0.2:
+        return "BEARISH"
+    return "SIDEWAYS"
+
+
 def get_market_regime() -> dict[str, str]:
     try:
         config = StrategyConfig()
-        nifty_data = fetch_index_data("^NSEI")
-        banknifty_data = fetch_index_data("^NSEBANK")
-        nifty_trend, adx, rsi = classify_index_trend(nifty_data, config)
-        banknifty_trend, _, _ = classify_index_trend(banknifty_data, config)
+        source = "UNKNOWN"
+        nifty_trend = "UNKNOWN"
+        adx = np.nan
+        rsi = np.nan
+        banknifty_trend = "UNKNOWN"
+
+        niftybees_data = _fetch_regime_history("NIFTYBEES.NS")
+        if not niftybees_data.empty:
+            nifty_trend, adx, rsi = classify_index_trend(niftybees_data, config)
+            source = "NIFTYBEES"
+            print("Market regime source: NIFTYBEES")
+        else:
+            basket = ["RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS"]
+            basket_trends: list[str] = []
+            adx_values: list[float] = []
+            rsi_values: list[float] = []
+            for symbol in basket:
+                try:
+                    symbol_data = _fetch_regime_history(symbol)
+                    if symbol_data.empty:
+                        continue
+                    symbol_trend, symbol_adx, symbol_rsi = classify_index_trend(symbol_data, config)
+                    basket_trends.append(symbol_trend)
+                    if np.isfinite(symbol_adx):
+                        adx_values.append(float(symbol_adx))
+                    if np.isfinite(symbol_rsi):
+                        rsi_values.append(float(symbol_rsi))
+                except Exception as exc:
+                    logger.info("Basket regime fetch failed for %s: %s", symbol, exc)
+                    continue
+
+            if basket_trends:
+                avg_score = float(np.mean([_trend_score(t) for t in basket_trends]))
+                nifty_trend = _score_to_trend(avg_score)
+                adx = float(np.mean(adx_values)) if adx_values else np.nan
+                rsi = float(np.mean(rsi_values)) if rsi_values else np.nan
+                banknifty_trend = "BASKET"
+                source = "Basket"
+                print("Market regime source: Basket")
+            else:
+                source = "Unavailable"
+                print("Market regime source: Unavailable")
+                logger.info("No market regime data from NIFTYBEES or basket; returning UNKNOWN regime")
+                return default_market_regime("")
 
         if nifty_trend == "BULLISH":
             market_type = "TRENDING_BULLISH"
@@ -902,8 +1294,8 @@ def get_market_regime() -> dict[str, str]:
             "trend_confirmation": trend_confirmation,
             "nifty_trend": nifty_trend,
             "banknifty_trend": banknifty_trend,
-            "adx": f"{adx:.1f}",
-            "rsi": f"{rsi:.1f}",
+            "adx": f"{adx:.1f}" if np.isfinite(adx) else "-",
+            "rsi": f"{rsi:.1f}" if np.isfinite(rsi) else "-",
             "error": "",
         }
     except Exception as exc:
@@ -1827,6 +2219,7 @@ def scan_symbols(
 
     rows = []
     errors = []
+    no_data_symbols: list[str] = []
 
     market_data = pd.DataFrame()
     if not use_sample_data:
@@ -1845,6 +2238,10 @@ def scan_symbols(
                 if use_sample_data
                 else extract_symbol_history(market_data, symbol, len(symbols))
             )
+            if history.empty:
+                logger.info("Skipping %s: no price data returned", symbol)
+                no_data_symbols.append(symbol)
+                continue
             row = analyze_stock(symbol, history, config, market_regime)
             if row is not None:
                 rows.append(row)
@@ -1853,6 +2250,11 @@ def scan_symbols(
             logger.exception("Skipping %s", symbol)
 
     if not rows:
+        if no_data_symbols and not use_sample_data:
+            return empty_futures_table(), errors + [
+                f"No valid symbol data found: {len(no_data_symbols)} symbols returned no candles from Yahoo/Alpha/EODHD. "
+                "Check network/proxy/API keys, or enable 'Use sample data'."
+            ]
         return empty_futures_table(), errors or ["No valid symbol data found"]
 
     return sort_futures_table(pd.DataFrame(rows)), errors
@@ -2539,8 +2941,7 @@ def render_sidebar(fno_symbols: list[str], option_symbols: list[str]) -> tuple[l
         target_rr = st.slider("Target RR", 1.0, 5.0, 2.0, 0.5)
 
         if st.button("Refresh", type="primary", use_container_width=True):
-            download_market_data.clear()
-            fetch_index_data.clear()
+            clear_market_data_cache()
             load_stock_list.clear()
             load_option_list.clear()
             st.rerun()

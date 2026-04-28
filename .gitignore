@@ -12,3 +12,4 @@ __pycache__/
 .DS_Store
 dashboard_errors.log
 *.log
+*.indentbak
