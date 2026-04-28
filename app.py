@@ -73,6 +73,10 @@ FUTURES_COLUMNS = [
     "failed_conditions",
     "Exit Signal",
     "Reason",
+    "trend_watch_direction",
+    "trend_stage",
+    "trend_age",
+    "trend_watch_note",
 ]
 
 OPTIONS_COLUMNS = [
@@ -1565,6 +1569,8 @@ def insert_selected_trade_from_row(connection: sqlite3.Connection, row: pd.Serie
     signal = str(row.get("Signal", ""))
     if not is_trade_signal(signal):
         return False
+    if str(row.get("trend_stage", "")).upper() == "EMERGING":
+        return False
     stock = str(row["Stock"]).upper()
     entry = float(row.get("Entry", np.nan))
     sl = float(row.get("Stop Loss", np.nan))
@@ -1775,6 +1781,8 @@ def update_signals(connection: sqlite3.Connection, signals: pd.DataFrame, timest
         signal_name = str(signal["Signal"])
         if not is_trade_signal(signal_name):
             continue
+        if str(signal.get("trend_stage", "")).upper() == "EMERGING":
+            continue
 
         insert_signal(
             connection,
@@ -1914,6 +1922,137 @@ def detect_swings(data: pd.DataFrame, lookback: int = 2) -> tuple[list[tuple[int
                 swing_lows.append((idx, float(low_value)))
 
     return swing_highs, swing_lows
+
+
+def _trend_sep_ratio(row: pd.Series) -> float:
+    e20, e50 = float(row["EMA20"]), float(row["EMA50"])
+    if abs(e50) < 1e-9:
+        return 0.0
+    return abs(e20 - e50) / abs(e50)
+
+
+def compute_trend_watch_state(data: pd.DataFrame) -> dict[str, Any]:
+    """
+    Watchlist-only trend ladder (EMERGING → CONFIRMING → STRONG; INVALID clears).
+    Does not influence trade Signal / entries; used for UI and EMERGING trade blocks only.
+    """
+    empty = {
+        "trend_stage": "",
+        "trend_age": 0,
+        "trend_watch_note": "",
+        "trend_watch_direction": "",
+    }
+    if len(data) < 25:
+        return empty
+
+    stage = ""
+    direction = ""
+    emerging_streak = 0
+    watch_age = 0
+
+    for i in range(len(data)):
+        row = data.iloc[i]
+        close = float(row["Close"])
+        ema20 = float(row["EMA20"])
+        ema50 = float(row["EMA50"])
+        rsi = float(row["RSI"])
+        vol = float(row["Volume"])
+        avg_v = float(row["Avg Volume"])
+        prev_rsi = float(data.iloc[i - 1]["RSI"]) if i > 0 else float(rsi)
+        sep = _trend_sep_ratio(row)
+        prev_sep = _trend_sep_ratio(data.iloc[i - 1]) if i > 0 else sep
+
+        vol_soft = avg_v * 1.2 if avg_v > 1e-9 else np.inf
+
+        long_inv = close < ema20 or rsi < 50.0
+        short_inv = close > ema20 or rsi > 50.0
+
+        long_enter_em = (
+            ema20 > ema50 and close > ema20 and 50.0 <= rsi < 60.0 and vol < vol_soft
+        )
+        short_enter_em = (
+            ema20 < ema50 and close < ema20 and 40.0 < rsi <= 50.0 and vol < vol_soft
+        )
+
+        long_hold_em_body = ema20 > ema50 and close > ema20 and 50.0 <= rsi < 60.0
+        short_hold_em_body = ema20 < ema50 and close < ema20 and 40.0 < rsi <= 50.0
+
+        if stage in ("", "INVALID"):
+            stage = ""
+            direction = ""
+            emerging_streak = 0
+            watch_age = 0
+            if long_enter_em:
+                stage, direction = "EMERGING", "LONG"
+                emerging_streak = 1
+                watch_age = 1
+            elif short_enter_em:
+                stage, direction = "EMERGING", "SHORT"
+                emerging_streak = 1
+                watch_age = 1
+            continue
+
+        if stage == "EMERGING":
+            if direction == "LONG":
+                if long_inv or not (ema20 > ema50 and close > ema20):
+                    stage, direction, emerging_streak, watch_age = "INVALID", "", 0, 0
+                elif long_hold_em_body:
+                    emerging_streak += 1
+                    watch_age += 1
+                    if emerging_streak >= 2 and close > ema20 and rsi >= prev_rsi - 0.25:
+                        stage = "CONFIRMING"
+                        emerging_streak = 0
+                else:
+                    watch_age += 1
+            else:
+                if short_inv or not (ema20 < ema50 and close < ema20):
+                    stage, direction, emerging_streak, watch_age = "INVALID", "", 0, 0
+                elif short_hold_em_body:
+                    emerging_streak += 1
+                    watch_age += 1
+                    if emerging_streak >= 2 and close < ema20 and rsi <= prev_rsi + 0.25:
+                        stage = "CONFIRMING"
+                        emerging_streak = 0
+                else:
+                    watch_age += 1
+
+        elif stage == "CONFIRMING":
+            if direction == "LONG":
+                if long_inv:
+                    stage, direction, emerging_streak, watch_age = "INVALID", "", 0, 0
+                else:
+                    watch_age += 1
+                    avg_ok = avg_v > 1e-9 and vol > avg_v * 1.05
+                    if sep > prev_sep and rsi > 60.0 and avg_ok:
+                        stage = "STRONG"
+            else:
+                if short_inv:
+                    stage, direction, emerging_streak, watch_age = "INVALID", "", 0, 0
+                else:
+                    watch_age += 1
+                    avg_ok = avg_v > 1e-9 and vol > avg_v * 1.05
+                    if sep > prev_sep and rsi < 40.0 and avg_ok:
+                        stage = "STRONG"
+
+        elif stage == "STRONG":
+            if direction == "LONG" and long_inv:
+                stage, direction, emerging_streak, watch_age = "INVALID", "", 0, 0
+            elif direction == "SHORT" and short_inv:
+                stage, direction, emerging_streak, watch_age = "INVALID", "", 0, 0
+
+    if stage == "INVALID":
+        return empty
+
+    note = ""
+    if stage == "CONFIRMING":
+        note = "Preparing for breakdown" if direction == "SHORT" else "Preparing for breakout"
+
+    return {
+        "trend_stage": stage,
+        "trend_age": int(watch_age) if stage else 0,
+        "trend_watch_note": note,
+        "trend_watch_direction": direction,
+    }
 
 
 def structure_state(
@@ -2142,6 +2281,8 @@ def evaluate_symbol(
         market_type=market_type,
     )
 
+    tw = compute_trend_watch_state(data)
+
     return {
         "Stock": symbol,
         "Signal": signal,
@@ -2177,6 +2318,10 @@ def evaluate_symbol(
         "failed_conditions": explain["failed_conditions"],
         "Exit Signal": exit_signal,
         "Reason": reason,
+        "trend_watch_direction": tw["trend_watch_direction"],
+        "trend_stage": tw["trend_stage"],
+        "trend_age": tw["trend_age"],
+        "trend_watch_note": tw["trend_watch_note"],
     }
 
 
@@ -2448,6 +2593,7 @@ def format_futures_table(data: pd.DataFrame):
             "distance_from_ema": "{:,.4f}",
             "trend_strength": "{:,.4f}",
             "Confidence Score": "{:.0f}",
+            "trend_age": "{:.0f}",
         },
         na_rep="-",
     )
@@ -2761,6 +2907,13 @@ def render_trade_explain_body(row: pd.Series) -> None:
     st.markdown(
         f"**Confidence:** {int(row.get('Confidence Score', 0) or 0)}/5 · **Quality:** {row.get('Trade Quality', '—')}"
     )
+    if row.get("trend_stage"):
+        st.markdown(
+            f"**Trend watch:** {row.get('trend_watch_direction', '—')} · "
+            f"stage **{row.get('trend_stage', '—')}** · age **{row.get('trend_age', '—')}** candles"
+        )
+        if str(row.get("trend_watch_note", "")).strip():
+            st.markdown(f"**Note:** {row.get('trend_watch_note')}")
     failures = _failed_messages(row.get("failed_conditions"))
     if failures:
         st.markdown("**Why not perfect:**")
@@ -2809,7 +2962,9 @@ def render_trade_cards(data: pd.DataFrame, side: str) -> None:
                     ):
                         st.markdown("**Why this trade?**")
                         render_trade_explain_body(row)
-                if is_trade_signal(str(row.get("Signal", ""))):
+                if is_trade_signal(str(row.get("Signal", ""))) and str(
+                    row.get("trend_stage", "")
+                ).upper() != "EMERGING":
                     btn_key = f"select_trade_{side}_{start}_{pos}"
                     if st.button("Select Trade", key=btn_key, use_container_width=True):
                         with get_db_connection() as wconn:
@@ -3026,6 +3181,8 @@ def render_top_trade_highlight(signals: pd.DataFrame) -> None:
         return
 
     candidates = signals[signals["Signal"].isin(trade_signals)].copy()
+    if "trend_stage" in candidates.columns:
+        candidates = candidates[candidates["trend_stage"].astype(str).str.upper() != "EMERGING"]
     if candidates.empty:
         st.info("Top Trade Highlight: no actionable trade signal right now.")
         return
@@ -3075,6 +3232,56 @@ def render_scan_status(signals: pd.DataFrame, errors: list[str]) -> None:
 
     with st.expander("Scan diagnostics"):
         st.dataframe(format_futures_table(signals), use_container_width=True, hide_index=True)
+
+
+def render_trend_watch_sections(signals: pd.DataFrame) -> None:
+    """Emerging / confirming / strong trend ladder — watchlist only; does not change Signal or filters."""
+    st.subheader("Trend watchlist")
+    st.caption(
+        "Stages are informational. LONG/SHORT signals and filters are unchanged. "
+        "EMERGING: no Select Trade and no new rows in the signals history table."
+    )
+    if signals.empty or "trend_stage" not in signals.columns:
+        st.info("No scan data for trend watchlist.")
+        return
+
+    table_cols = [
+        c
+        for c in (
+            "Stock",
+            "Signal",
+            "trend_watch_direction",
+            "trend_stage",
+            "trend_age",
+            "trend_watch_note",
+            "Current Price",
+            "RSI",
+            "EMA20",
+        )
+        if c in signals.columns
+    ]
+
+    st.markdown("#### 🟡 Emerging Trends (Watchlist)")
+    em = signals[signals["trend_stage"].astype(str).str.upper() == "EMERGING"].copy()
+    if em.empty:
+        st.caption("None right now.")
+    else:
+        st.dataframe(em[table_cols], use_container_width=True, hide_index=True)
+
+    st.markdown("#### 🟠 Confirming Trends")
+    cf = signals[signals["trend_stage"].astype(str).str.upper() == "CONFIRMING"].copy()
+    if cf.empty:
+        st.caption("None right now.")
+    else:
+        st.dataframe(cf[table_cols], use_container_width=True, hide_index=True)
+
+    st.markdown("#### 🟢 Strong Trades (trend ladder)")
+    sg = signals[signals["trend_stage"].astype(str).str.upper() == "STRONG"].copy()
+    if sg.empty:
+        st.caption("None right now.")
+    else:
+        st.caption("Trend-stage STRONG (EMA separation + RSI + volume); not the same as STRONG_LONG / STRONG_SHORT alone.")
+        st.dataframe(sg[table_cols], use_container_width=True, hide_index=True)
 
 
 def main() -> None:
@@ -3147,6 +3354,7 @@ def main() -> None:
     render_top_trade_highlight(signals)
     render_market_regime(regime, signals, last_updated)
     render_scan_status(signals, errors)
+    render_trend_watch_sections(signals)
     render_trade_section("🟢 LONG TRADES", long_trades, long_options, "LONG")
     render_trade_section("🔴 SHORT TRADES", short_trades, short_options, "SHORT")
     render_active_trades(active_history, signals)
