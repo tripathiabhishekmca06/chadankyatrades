@@ -11,5 +11,10 @@ __pycache__/
 *.db-wal
 .DS_Store
 dashboard_errors.log
+logs/
 *.log
 *.indentbak
+# Runtime last-LIVE-API timestamp for market timer (local / deploy-specific)
+data/market_api_meta.json
+data/api_usage_state.json
+data/market_cache_latest.pkl

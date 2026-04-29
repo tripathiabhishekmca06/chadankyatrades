@@ -33,7 +33,7 @@ cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 streamlit run app.py
 ```
 
-Without keys, Yahoo-only market data still runs; Alpha/EODHD fallbacks stay disabled.
+Market OHLCV uses Alpha Vantage first, then EODHD per symbol; configure at least one of those API keys for live data (or use **Use sample data** in the sidebar).
 
 ## Run locally
 

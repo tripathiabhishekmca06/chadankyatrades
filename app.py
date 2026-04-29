@@ -6,11 +6,14 @@ import logging
 import os
 import re
 import sqlite3
+import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -20,6 +23,7 @@ import pandas as pd
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+import yfinance as yf
 
 from settings import get_alpha_vantage_api_key, get_eodhd_api_key
 
@@ -28,7 +32,9 @@ DATA_DIR = APP_DIR / "data"
 FNO_LIST_PATH = DATA_DIR / "fno_list.csv"
 OPTIONS_LIST_PATH = DATA_DIR / "options_list.csv"
 SIGNALS_DB_PATH = APP_DIR / "signals.db"
-LOG_PATH = APP_DIR / "dashboard_errors.log"
+LOG_DIR = APP_DIR / "logs"
+LOG_PATH = LOG_DIR / "trading_dashboard.log"
+_TRADING_LOG_BOOTSTRAPPED = False
 
 OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 
@@ -144,27 +150,41 @@ SIGNAL_PRIORITY = {
     "WAIT": 4,
 }
 
-CACHE_TTL = 60
 ALPHA_API_KEY = get_alpha_vantage_api_key()
 EODHD_API_KEY = get_eodhd_api_key()
 
 ALPHA_API_MINUTE_LIMIT = 5
 ALPHA_API_DAY_LIMIT = 500
 EODHD_API_MINUTE_LIMIT = 20
+CACHE_TTL = 60.0
+YAHOO_FETCH_CACHE_TTL_SECONDS = CACHE_TTL
+YAHOO_MIN_CALL_GAP_SECONDS = 2.0
 API_USAGE_STATE_KEY = "_api_usage_tracker_v1"
+API_USAGE_PERSIST_PATH = DATA_DIR / "api_usage_state.json"
 MARKET_SESSION_CACHE_TTL = 90.0
+# Frontend bar/button must match get_market_data_with_cache TTL and force window (seconds of TTL left).
+MARKET_FORCE_REFRESH_ENABLE_REMAINING_SEC = 30
+MARKET_UI_WARNING_REMAINING_SEC = 15
 MARKET_FORCE_NEXT_KEY = "_market_force_refresh_next"
 MARKET_FETCH_META_KEY = "_market_fetch_meta"
 MARKET_QUOTA_FLAG_KEY = "_market_quota_low_flag"
 MARKET_SCAN_NONCE_KEY = "_market_scan_refresh_nonce"
+# Persists last successful LIVE market fetch time across browser sessions (for timer + skipping redundant API).
+MARKET_API_META_PATH = DATA_DIR / "market_api_meta.json"
+# Last merged OHLCV snapshot from a LIVE get_market_data run (same TTL as MARKET_SESSION_CACHE_TTL).
+MARKET_CACHE_DF_PATH = DATA_DIR / "market_cache_latest.pkl"
 # EODHD intraday is one symbol per request; use parallel workers + Session to cut wall time.
 EODHD_FALLBACK_MAX_WORKERS = 4
-YAHOO_FETCH_CACHE_TTL_SECONDS = CACHE_TTL
-YAHOO_MIN_CALL_GAP_SECONDS = 2.0
-_YAHOO_FETCH_CACHE: dict[tuple[Any, ...], tuple[float, pd.DataFrame]] = {}
-_YAHOO_LAST_CALL_TS = 0.0
 _ALPHA_LAST_CALL_TS = 0.0
 _EODHD_LAST_CALL_TS = 0.0
+_YAHOO_LAST_CALL_TS = 0.0
+_YAHOO_FETCH_CACHE: dict[tuple[Any, ...], tuple[float, pd.DataFrame]] = {}
+_YAHOO_CACHE_LOCK = threading.Lock()
+# Set when Alpha returns a premium / unavailable intraday message so we skip further intraday calls.
+_ALPHA_INTRADAY_BLOCKED = False
+# EODHD ``BASE.suffix`` for India (resolved once; override with EODHD_NSE_EXCHANGE_CODE).
+_EODHD_NSE_EXCHANGE_SUFFIX: str | None = None
+_EODHD_SUFFIX_LOCK = threading.Lock()
 
 SYMBOL_COLUMN_CANDIDATES = (
     "symbol",
@@ -182,35 +202,56 @@ DEFAULT_STREAMLIT_HOST = os.getenv("HOST", "0.0.0.0")
 DEFAULT_STREAMLIT_PORT = int(os.getenv("PORT", os.getenv("STREAMLIT_SERVER_PORT", "8501")))
 
 logger = logging.getLogger("trading_dashboard")
-if not logger.handlers:
-    logging.basicConfig(
-        filename=LOG_PATH,
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
+
+
+def configure_trading_dashboard_logging() -> None:
+    """
+    File logging under logs/trading_dashboard.log (rotated). Idempotent across Streamlit reruns.
+
+    Env:
+      TRADING_DASHBOARD_CONSOLE_LOG=1 — mirror INFO+ to stderr (terminal).
+      TRADING_DASHBOARD_VERBOSE_API=1 — DEBUG for this logger (per-request API detail).
+    """
+    global _TRADING_LOG_BOOTSTRAPPED
+    if _TRADING_LOG_BOOTSTRAPPED:
+        return
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    verbose = os.getenv("TRADING_DASHBOARD_VERBOSE_API", "").strip().lower() in {"1", "true", "yes", "on"}
+    level = logging.DEBUG if verbose else logging.INFO
+    logger.setLevel(level)
+    logger.propagate = False
+    if logger.handlers:
+        logger.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    file_handler = RotatingFileHandler(
+        LOG_PATH,
+        maxBytes=5_000_000,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(level)
+    file_handler.setFormatter(fmt)
+    logger.addHandler(file_handler)
+    if os.getenv("TRADING_DASHBOARD_CONSOLE_LOG", "").strip().lower() in {"1", "true", "yes", "on"}:
+        console = logging.StreamHandler(sys.stderr)
+        console.setLevel(level)
+        console.setFormatter(fmt)
+        logger.addHandler(console)
+    _TRADING_LOG_BOOTSTRAPPED = True
+    logger.info(
+        "Logging initialized path=%s verbose_api=%s console=%s",
+        LOG_PATH,
+        verbose,
+        os.getenv("TRADING_DASHBOARD_CONSOLE_LOG", ""),
     )
 
 
 def configure_runtime_environment() -> None:
+    configure_trading_dashboard_logging()
     # Ensure local writable paths exist for cloud/container environments.
     SIGNALS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    # yfinance attempts to use a user cache directory that may be unavailable in cloud sandboxes.
-    try:
-        import yfinance as yf
-    except Exception:
-        return
-
-    cache_dir = APP_DIR / ".yfinance_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    set_cache_location = getattr(yf, "set_tz_cache_location", None)
-    if callable(set_cache_location):
-        try:
-            set_cache_location(str(cache_dir))
-        except Exception:
-            logger.info("Unable to set yfinance cache directory at %s", cache_dir)
-
 
 @dataclass(frozen=True)
 class StrategyConfig:
@@ -404,7 +445,8 @@ def parse_manual_symbols(raw_symbols: str) -> list[str]:
     return list(dict.fromkeys(symbols))
 
 
-def to_yahoo_symbol(symbol: str) -> str:
+def to_market_ticker_key(symbol: str) -> str:
+    """Column key for merged OHLCV (NSE-style *.NS suffix for MultiIndex columns)."""
     return symbol.upper() if symbol.upper().endswith(".NS") else f"{symbol.upper()}.NS"
 
 
@@ -425,7 +467,7 @@ def _normalize_ohlcv_frame(data: pd.DataFrame) -> pd.DataFrame:
     return frame.sort_index()
 
 
-def _extract_yahoo_symbol_frame(payload: pd.DataFrame, ticker: str, total: int) -> pd.DataFrame:
+def _extract_merged_ticker_frame(payload: pd.DataFrame, ticker: str, total: int) -> pd.DataFrame:
     if payload.empty:
         return pd.DataFrame(columns=OHLCV_COLUMNS)
     if total == 1 and not isinstance(payload.columns, pd.MultiIndex):
@@ -435,13 +477,82 @@ def _extract_yahoo_symbol_frame(payload: pd.DataFrame, ticker: str, total: int) 
     return pd.DataFrame(columns=OHLCV_COLUMNS)
 
 
-def _to_alpha_symbol(yahoo_symbol: str) -> str:
-    return clean_underlying_symbol(yahoo_symbol) or yahoo_symbol.replace(".NS", "")
+def _to_alpha_symbol(market_ticker: str) -> str:
+    """
+    Alpha Vantage expects NSE listings as ``NSE:SYMBOL`` (or ``SYMBOL.NS``); bare symbols
+    return Invalid API call for Indian names.
+    """
+    base = clean_underlying_symbol(market_ticker) or market_ticker.replace(".NS", "")
+    base = (base or "").strip().upper()
+    if not base:
+        return ""
+    mt = str(market_ticker).upper()
+    if mt.endswith(".NS") or ".NS" in mt:
+        return f"NSE:{base}"
+    return base
 
 
-def _to_eodhd_symbol(yahoo_symbol: str) -> str:
-    base = clean_underlying_symbol(yahoo_symbol) or yahoo_symbol.replace(".NS", "")
-    return f"{base}.NSE"
+def _ensure_eodhd_nse_exchange_suffix(session: requests.Session | None = None) -> str:
+    """
+    EODHD uses ``BASE.EXCHANGE``; NSE India is usually ``.NSE`` but some accounts/eras use
+    other codes. Probe once per process (override with env EODHD_NSE_EXCHANGE_CODE).
+    """
+    global _EODHD_NSE_EXCHANGE_SUFFIX
+    if _EODHD_NSE_EXCHANGE_SUFFIX is not None:
+        return _EODHD_NSE_EXCHANGE_SUFFIX
+    with _EODHD_SUFFIX_LOCK:
+        if _EODHD_NSE_EXCHANGE_SUFFIX is not None:
+            return _EODHD_NSE_EXCHANGE_SUFFIX
+        override = os.getenv("EODHD_NSE_EXCHANGE_CODE", "").strip().upper()
+        if override:
+            _EODHD_NSE_EXCHANGE_SUFFIX = override
+            logger.info("EODHD India exchange suffix from env: %s", override)
+            return _EODHD_NSE_EXCHANGE_SUFFIX
+        if not EODHD_API_KEY:
+            _EODHD_NSE_EXCHANGE_SUFFIX = "NSE"
+            return _EODHD_NSE_EXCHANGE_SUFFIX
+        sess = session if session is not None else requests.Session()
+        candidates = ("NSE", "XNSE", "NS", "IN")
+        for suf in candidates:
+            probe = f"RELIANCE.{suf}"
+            try:
+                r = sess.get(
+                    f"https://eodhd.com/api/eod/{probe}",
+                    params={"api_token": EODHD_API_KEY, "period": "d", "fmt": "json"},
+                    timeout=20,
+                )
+                record_eodhd_api_calls(1)
+            except Exception as exc:
+                logger.info("EODHD exchange probe failed for %s: %s", probe, exc)
+                continue
+            if not r.ok:
+                continue
+            try:
+                data = r.json()
+            except Exception:
+                continue
+            if isinstance(data, list) and len(data) >= 1:
+                _EODHD_NSE_EXCHANGE_SUFFIX = suf
+                logger.info(
+                    "EODHD India exchange auto-selected: %s (probe %s returned %s rows)",
+                    suf,
+                    probe,
+                    len(data),
+                )
+                return _EODHD_NSE_EXCHANGE_SUFFIX
+        _EODHD_NSE_EXCHANGE_SUFFIX = "NSE"
+        logger.warning(
+            "EODHD India exchange auto-detect failed (tried %s); using NSE. "
+            "If all tickers 404, set EODHD_NSE_EXCHANGE_CODE in the environment or verify your EODHD plan includes India.",
+            candidates,
+        )
+        return _EODHD_NSE_EXCHANGE_SUFFIX
+
+
+def _to_eodhd_symbol(market_ticker: str, session: requests.Session | None = None) -> str:
+    base = clean_underlying_symbol(market_ticker) or market_ticker.replace(".NS", "")
+    suffix = _ensure_eodhd_nse_exchange_suffix(session)
+    return f"{base}.{suffix}"
 
 
 def _alpha_wait() -> None:
@@ -462,23 +573,177 @@ def _eodhd_wait() -> None:
     _EODHD_LAST_CALL_TS = time.monotonic()
 
 
-def _fetch_alpha_intraday(yahoo_symbol: str, session: requests.Session | None = None) -> pd.DataFrame:
+def _map_interval_to_alpha(interval: str) -> str:
+    iv = (interval or "15m").strip().lower()
+    return {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "60m": "60min", "1h": "60min"}.get(iv, "15min")
+
+
+def _map_interval_to_eodhd(interval: str) -> str:
+    """
+    EODHD intraday API accepts only 1m, 5m, and 1h (see eodhd.com intraday docs). Other UI
+    intervals are mapped to the closest supported bucket so requests are not rejected/empty.
+    """
+    iv = (interval or "15m").strip().lower()
+    if iv == "1m":
+        return "1m"
+    if iv in {"5m", "15m"}:
+        return "5m"
+    if iv in {"30m", "60m", "1h"}:
+        return "1h"
+    return "5m"
+
+
+def _map_interval_to_yahoo(interval: str) -> str:
+    iv = (interval or "15m").strip().lower()
+    return {
+        "1m": "1m",
+        "2m": "2m",
+        "5m": "5m",
+        "15m": "15m",
+        "30m": "30m",
+        "60m": "60m",
+        "90m": "90m",
+        "1h": "60m",
+        "1d": "1d",
+    }.get(iv, "15m")
+
+
+def _map_period_to_yahoo(period: str) -> str:
+    """Map UI period strings to yfinance `period` values.
+
+    yfinance only accepts a fixed set (e.g. 1d, 7d, 1mo, …). Values like ``30d``
+    are not valid; using the old ``else "7d"`` default caused ~45 hourly bars for
+    a "30d" scan and every symbol failed ``StrategyConfig.minimum_rows`` (60).
+    """
+    p = (period or "7d").strip().lower()
+    allowed = {
+        "1d",
+        "5d",
+        "7d",
+        "1mo",
+        "3mo",
+        "6mo",
+        "1y",
+        "2y",
+        "5y",
+        "10y",
+        "ytd",
+        "max",
+    }
+    if p in allowed:
+        return p
+    if p.endswith("d"):
+        try:
+            days = int(p[:-1])
+        except ValueError:
+            return "7d"
+        if days <= 5:
+            mapped = "5d"
+        elif days <= 7:
+            mapped = "7d"
+        elif days <= 31:
+            mapped = "1mo"
+        elif days <= 93:
+            mapped = "3mo"
+        elif days <= 186:
+            mapped = "6mo"
+        elif days <= 400:
+            mapped = "1y"
+        elif days <= 800:
+            mapped = "2y"
+        else:
+            mapped = "5y"
+        if p != mapped:
+            logger.info("Yahoo period: UI %r maps to yfinance period=%r (need enough bars for indicators)", period, mapped)
+        return mapped
+    return "7d"
+
+
+def _yahoo_rate_limit_wait() -> None:
+    global _YAHOO_LAST_CALL_TS
+    now = time.monotonic()
+    wait_for = float(YAHOO_MIN_CALL_GAP_SECONDS) - (now - _YAHOO_LAST_CALL_TS)
+    if wait_for > 0:
+        time.sleep(wait_for)
+    _YAHOO_LAST_CALL_TS = time.monotonic()
+
+
+def _yahoo_cache_get(key: tuple[Any, ...]) -> pd.DataFrame | None:
+    now = time.time()
+    with _YAHOO_CACHE_LOCK:
+        hit = _YAHOO_FETCH_CACHE.get(key)
+        if not hit:
+            return None
+        ts, frame = hit
+        if (now - float(ts)) > float(YAHOO_FETCH_CACHE_TTL_SECONDS):
+            _YAHOO_FETCH_CACHE.pop(key, None)
+            return None
+        return frame.copy()
+
+
+def _yahoo_cache_set(key: tuple[Any, ...], frame: pd.DataFrame) -> None:
+    if frame is None or frame.empty:
+        return
+    with _YAHOO_CACHE_LOCK:
+        _YAHOO_FETCH_CACHE[key] = (time.time(), frame.copy())
+
+
+def _yahoo_dns_ok() -> bool:
+    """Best-effort DNS probe for Yahoo cookie/consent host used by yfinance."""
+    try:
+        import socket
+
+        socket.getaddrinfo("guce.yahoo.com", 443)
+        return True
+    except Exception as exc:
+        logger.warning("Yahoo DNS probe failed for guce.yahoo.com: %s", exc)
+        return False
+
+
+def _fetch_alpha_intraday(
+    market_ticker: str,
+    interval: str,
+    session: requests.Session | None = None,
+) -> pd.DataFrame:
+    global _ALPHA_INTRADAY_BLOCKED
     if not ALPHA_API_KEY:
         return pd.DataFrame(columns=OHLCV_COLUMNS)
+    alpha_iv = _map_interval_to_alpha(interval)
+    sym = _to_alpha_symbol(market_ticker)
+    logger.info("API Alpha Vantage: TIME_SERIES_INTRADAY request symbol=%s interval=%s", sym, alpha_iv)
     _alpha_wait()
     params = {
         "function": "TIME_SERIES_INTRADAY",
-        "symbol": _to_alpha_symbol(yahoo_symbol),
-        "interval": "15min",
+        "symbol": sym,
+        "interval": alpha_iv,
         "outputsize": "compact",
         "apikey": ALPHA_API_KEY,
     }
     sess = session if session is not None else requests
     response = sess.get("https://www.alphavantage.co/query", params=params, timeout=20)
     record_alpha_api_call()
+    if not response.ok:
+        logger.warning(
+            "API Alpha Vantage: HTTP %s for symbol=%s interval=%s",
+            response.status_code,
+            sym,
+            alpha_iv,
+        )
     payload = response.json() if response.ok else {}
-    series = payload.get("Time Series (15min)")
+    series = payload.get(f"Time Series ({alpha_iv})")
     if not isinstance(series, dict) or not series:
+        note = payload.get("Note") or payload.get("Information") or payload.get("Error Message")
+        if note:
+            logger.info("API Alpha Vantage: no series for %s — %s", sym, str(note)[:200])
+            low = str(note).lower()
+            if "premium" in low or "subscribe" in low:
+                _ALPHA_INTRADAY_BLOCKED = True
+                logger.warning(
+                    "Alpha TIME_SERIES_INTRADAY not available on this key (premium/subscription message). "
+                    "Further intraday calls skipped this process; use EODHD or Alpha daily."
+                )
+        else:
+            logger.info("API Alpha Vantage: empty intraday series for %s interval=%s", sym, alpha_iv)
         return pd.DataFrame(columns=OHLCV_COLUMNS)
     rows = pd.DataFrame.from_dict(series, orient="index")
     rows.index = pd.to_datetime(rows.index, errors="coerce")
@@ -491,29 +756,100 @@ def _fetch_alpha_intraday(yahoo_symbol: str, session: requests.Session | None = 
             "5. volume": "Volume",
         }
     )
-    return _normalize_ohlcv_frame(rows)
+    out = _normalize_ohlcv_frame(rows)
+    logger.info(
+        "API Alpha Vantage: success symbol=%s rows=%s",
+        sym,
+        len(out.index),
+    )
+    return out
+
+
+def _fetch_alpha_daily(
+    market_ticker: str,
+    session: requests.Session | None = None,
+) -> pd.DataFrame:
+    """TIME_SERIES_DAILY (compact) — usually included on free Alpha keys when intraday is not."""
+    if not ALPHA_API_KEY:
+        return pd.DataFrame(columns=OHLCV_COLUMNS)
+    sym = _to_alpha_symbol(market_ticker)
+    logger.info("API Alpha Vantage: TIME_SERIES_DAILY request symbol=%s", sym)
+    _alpha_wait()
+    params = {
+        "function": "TIME_SERIES_DAILY",
+        "symbol": sym,
+        "outputsize": "compact",
+        "apikey": ALPHA_API_KEY,
+    }
+    sess = session if session is not None else requests
+    response = sess.get("https://www.alphavantage.co/query", params=params, timeout=20)
+    record_alpha_api_call()
+    if not response.ok:
+        logger.warning("API Alpha Vantage: daily HTTP %s for %s", response.status_code, sym)
+        return pd.DataFrame(columns=OHLCV_COLUMNS)
+    payload = response.json()
+    series = payload.get("Time Series (Daily)")
+    if not isinstance(series, dict) or not series:
+        note = payload.get("Note") or payload.get("Information") or payload.get("Error Message")
+        if note:
+            logger.info("API Alpha Vantage: no daily series for %s — %s", sym, str(note)[:200])
+        return pd.DataFrame(columns=OHLCV_COLUMNS)
+    rows = pd.DataFrame.from_dict(series, orient="index")
+    rows.index = pd.to_datetime(rows.index, errors="coerce")
+    rows = rows.rename(
+        columns={
+            "1. open": "Open",
+            "2. high": "High",
+            "3. low": "Low",
+            "4. close": "Close",
+            "5. volume": "Volume",
+        }
+    )
+    out = _normalize_ohlcv_frame(rows)
+    logger.info("API Alpha Vantage: daily success symbol=%s rows=%s", sym, len(out.index))
+    return out
 
 
 def _fetch_eodhd_intraday_or_daily(
-    yahoo_symbol: str,
+    market_ticker: str,
+    interval: str,
     session: requests.Session | None = None,
     throttle: bool = True,
 ) -> tuple[pd.DataFrame, int]:
     if not EODHD_API_KEY:
         return pd.DataFrame(columns=OHLCV_COLUMNS), 0
-    eod_symbol = _to_eodhd_symbol(yahoo_symbol)
     sess = session if session is not None else requests
+    eod_symbol = _to_eodhd_symbol(market_ticker, sess)
+    eod_iv = _map_interval_to_eodhd(interval)
     http_calls = 0
 
     if throttle:
         _eodhd_wait()
     intraday_url = f"https://eodhd.com/api/intraday/{eod_symbol}"
-    intraday_params = {"api_token": EODHD_API_KEY, "interval": "15m", "fmt": "json"}
+    intraday_params = {"api_token": EODHD_API_KEY, "interval": eod_iv, "fmt": "json"}
+    logger.debug("API EODHD: intraday GET %s interval=%s throttle=%s", eod_symbol, eod_iv, throttle)
     intraday_resp = sess.get(intraday_url, params=intraday_params, timeout=20)
     http_calls += 1
     if intraday_resp.ok:
-        payload = intraday_resp.json()
-        if isinstance(payload, list) and payload:
+        try:
+            payload = intraday_resp.json()
+        except Exception as exc:
+            logger.warning(
+                "API EODHD: intraday JSON parse failed for %s: %s body_prefix=%r",
+                eod_symbol,
+                exc,
+                (intraday_resp.text or "")[:200],
+            )
+            payload = None
+        if isinstance(payload, dict):
+            logger.warning(
+                "API EODHD: intraday non-list response for %s interval=%s (from UI %s): %s",
+                eod_symbol,
+                eod_iv,
+                interval,
+                str(payload)[:400],
+            )
+        elif isinstance(payload, list) and payload:
             rows = pd.DataFrame(payload)
             rows["Datetime"] = pd.to_datetime(rows.get("datetime"), errors="coerce")
             rows = rows.set_index("Datetime").rename(
@@ -527,18 +863,58 @@ def _fetch_eodhd_intraday_or_daily(
             )
             frame = _normalize_ohlcv_frame(rows)
             if not frame.empty:
+                logger.info(
+                    "API EODHD: intraday OK %s rows=%s interval=%s",
+                    eod_symbol,
+                    len(frame.index),
+                    eod_iv,
+                )
                 return frame, http_calls
+        elif isinstance(payload, list) and not payload:
+            logger.info(
+                "API EODHD: intraday empty list for %s interval=%s — trying daily EOD",
+                eod_symbol,
+                eod_iv,
+            )
+    else:
+        logger.warning(
+            "API EODHD: intraday HTTP %s for %s body_prefix=%r",
+            intraday_resp.status_code,
+            eod_symbol,
+            (intraday_resp.text or "")[:240],
+        )
 
     if throttle:
         _eodhd_wait()
     daily_url = f"https://eodhd.com/api/eod/{eod_symbol}"
     daily_params = {"api_token": EODHD_API_KEY, "period": "d", "fmt": "json"}
+    logger.debug("API EODHD: daily EOD GET %s (intraday empty or missing)", eod_symbol)
     daily_resp = sess.get(daily_url, params=daily_params, timeout=20)
     http_calls += 1
     if not daily_resp.ok:
+        logger.warning(
+            "API EODHD: daily HTTP %s for %s body_prefix=%r",
+            daily_resp.status_code,
+            eod_symbol,
+            (daily_resp.text or "")[:240],
+        )
         return pd.DataFrame(columns=OHLCV_COLUMNS), http_calls
-    payload = daily_resp.json()
+    try:
+        payload = daily_resp.json()
+    except Exception as exc:
+        logger.warning(
+            "API EODHD: daily JSON parse failed for %s: %s body_prefix=%r",
+            eod_symbol,
+            exc,
+            (daily_resp.text or "")[:200],
+        )
+        return pd.DataFrame(columns=OHLCV_COLUMNS), http_calls
     if not isinstance(payload, list) or not payload:
+        logger.warning(
+            "API EODHD: daily empty or non-list payload for %s: %s",
+            eod_symbol,
+            str(payload)[:400],
+        )
         return pd.DataFrame(columns=OHLCV_COLUMNS), http_calls
     rows = pd.DataFrame(payload)
     rows["Datetime"] = pd.to_datetime(rows.get("date"), errors="coerce")
@@ -551,249 +927,396 @@ def _fetch_eodhd_intraday_or_daily(
             "volume": "Volume",
         }
     )
-    return _normalize_ohlcv_frame(rows), http_calls
-
-
-def get_market_data(symbols: tuple[str, ...], interval: str = "15m", period: str = "7d") -> pd.DataFrame:
-    if not symbols:
-        return pd.DataFrame()
-
-    try:
-        import yfinance as yf
-    except ImportError as exc:
-        raise RuntimeError("yfinance is not installed. Run pip install -r requirements.txt") from exc
-
-    tickers = tuple(to_yahoo_symbol(symbol) for symbol in symbols)
-    cache_key = ("multi_source_market_data", tickers, interval, period)
-    cached = _yahoo_cache_get(cache_key)
-    if cached is not None:
-        print("Cache used")
-        return cached
-
-    _yahoo_rate_limit_wait()
-    yahoo_payload = pd.DataFrame()
-    try:
-        yahoo_payload = yf.download(
-            tickers=list(tickers),
-            interval=interval,
-            period=period,
-            auto_adjust=False,
-            group_by="ticker",
-            progress=False,
-            threads=True,
+    daily_frame = _normalize_ohlcv_frame(rows)
+    if daily_frame.empty:
+        logger.warning(
+            "API EODHD: daily bars normalized to empty for %s (check symbol on EODHD)",
+            eod_symbol,
         )
-    except Exception as exc:
-        logger.info("Yahoo batch fetch failed: %s", exc)
+    else:
+        logger.info(
+            "API EODHD: daily fallback OK %s rows=%s http_calls=%s",
+            eod_symbol,
+            len(daily_frame.index),
+            http_calls,
+        )
+    return daily_frame, http_calls
 
+
+def _get_market_data_bulk_eodhd(
+    symbols: tuple[str, ...],
+    tickers: tuple[str, ...],
+    interval: str,
+) -> pd.DataFrame:
+    """Parallel EODHD-only fetch for large symbol lists (avoids Alpha's 5/min serial bottleneck)."""
+    t0 = time.perf_counter()
     frames_by_ticker: dict[str, pd.DataFrame] = {}
-    missing: list[str] = []
-    for ticker in tickers:
-        frame = _extract_yahoo_symbol_frame(yahoo_payload, ticker, len(tickers))
-        if frame.empty:
-            missing.append(ticker)
-        else:
-            frames_by_ticker[ticker] = frame
+    failed_symbols: list[str] = []
+    eod_http_total = 0
+    n_sym = len(symbols)
+    max_workers = min(EODHD_FALLBACK_MAX_WORKERS, max(1, n_sym))
+    logger.info(
+        "get_market_data bulk EODHD: starting parallel fetch symbols=%s workers=%s interval=%s",
+        n_sym,
+        max_workers,
+        interval,
+    )
 
-    yahoo_success_count = len(frames_by_ticker)
-    alpha_fallback_count = 0
-    eodhd_fallback_count = 0
+    def _one(i: int) -> tuple[str, str, pd.DataFrame, int]:
+        raw_sym = symbols[i]
+        ticker = tickers[i]
+        sess = requests.Session()
+        try:
+            frame, n_http = _fetch_eodhd_intraday_or_daily(
+                ticker, interval, session=sess, throttle=False
+            )
+            return str(raw_sym), ticker, frame, int(n_http)
+        except Exception as exc:
+            logger.info("EODHD fetch failed for %s: %s", ticker, exc)
+            return str(raw_sym), ticker, pd.DataFrame(columns=OHLCV_COLUMNS), 0
 
-    # Yahoo: yf.download is already multi-ticker. Alpha Vantage TIME_SERIES_INTRADAY is one symbol
-    # per request (no official batch for NSE intraday). EODHD intraday is per symbol; we use a
-    # shared Session plus limited parallel workers for the EODHD fallback to reduce wall time.
-
-    with requests.Session() as http_session:
-        still_missing: list[str] = []
-        for ticker in missing:
-            try:
-                frame = _fetch_alpha_intraday(ticker, http_session)
-            except Exception as exc:
-                logger.info("Alpha Vantage fetch failed for %s: %s", ticker, exc)
-                frame = pd.DataFrame(columns=OHLCV_COLUMNS)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_one, i): i for i in range(n_sym)}
+        for fut in as_completed(futures):
+            raw_sym, ticker, frame, nh = fut.result()
+            eod_http_total += nh
             if frame.empty:
-                still_missing.append(ticker)
+                failed_symbols.append(raw_sym)
+                logger.info("No EODHD OHLC data for %s", raw_sym)
             else:
                 frames_by_ticker[ticker] = frame
-                alpha_fallback_count += 1
-
-        def _eodhd_one(ticker: str) -> tuple[str, pd.DataFrame, int]:
-            try:
-                frame, n_http = _fetch_eodhd_intraday_or_daily(
-                    ticker, session=http_session, throttle=False
-                )
-                return ticker, frame, n_http
-            except Exception as exc:
-                logger.info("EODHD fetch failed for %s: %s", ticker, exc)
-                return ticker, pd.DataFrame(columns=OHLCV_COLUMNS), 0
-
-        if still_missing:
-            max_workers = min(EODHD_FALLBACK_MAX_WORKERS, len(still_missing))
-            if max_workers <= 1:
-                eod_results = [_eodhd_one(t) for t in still_missing]
-            else:
-                eod_results = []
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    future_map = {executor.submit(_eodhd_one, t): t for t in still_missing}
-                    for fut in as_completed(future_map):
-                        try:
-                            eod_results.append(fut.result())
-                        except Exception as exc:
-                            t_failed = future_map[fut]
-                            logger.info("EODHD worker failed for %s: %s", t_failed, exc)
-                            eod_results.append((t_failed, pd.DataFrame(columns=OHLCV_COLUMNS), 0))
-            eod_http_total = 0
-            for ticker, frame, n_http in eod_results:
-                eod_http_total += int(n_http)
-                if frame.empty:
-                    continue
-                frames_by_ticker[ticker] = frame
-                eodhd_fallback_count += 1
-            record_eodhd_api_calls(eod_http_total)
-
-    print(f"Yahoo success count: {yahoo_success_count}")
-    print(f"Alpha fallback count: {alpha_fallback_count}")
-    print(f"EODHD fallback count: {eodhd_fallback_count}")
+    record_eodhd_api_calls(eod_http_total)
+    elapsed = time.perf_counter() - t0
+    print("Alpha success count: 0")
+    print(f"EODHD success count: {len(frames_by_ticker)}")
+    if failed_symbols:
+        print(f"Failed symbols: {', '.join(failed_symbols)}")
+    logger.info(
+        "get_market_data bulk EODHD: done tickers_ok=%s failed=%s http_calls=%s elapsed_s=%.2f",
+        len(frames_by_ticker),
+        len(failed_symbols),
+        eod_http_total,
+        elapsed,
+    )
 
     if not frames_by_ticker:
+        logger.warning("get_market_data bulk EODHD: no frames returned")
         return pd.DataFrame()
-
     merged = pd.concat(frames_by_ticker, axis=1, sort=True).sort_index()
-    _yahoo_cache_set(cache_key, merged)
+    logger.info(
+        "get_market_data bulk EODHD: merged OHLCV shape=%s index_len=%s",
+        merged.shape,
+        len(merged.index),
+    )
     return merged
 
 
+def get_market_data(symbols: tuple[str, ...], interval: str = "15m", period: str = "7d") -> pd.DataFrame:
+    """
+    Multi-source OHLCV pipeline:
+    1) Yahoo batch download for all symbols.
+    2) Alpha intraday only for symbols still missing after Yahoo.
+    3) EODHD intraday/daily only for symbols still missing after Alpha.
+
+    A small in-process Yahoo cache avoids re-downloading identical request tuples for 60s.
+    """
+    if not symbols:
+        logger.info("get_market_data: empty symbol list, returning empty DataFrame")
+        return pd.DataFrame()
+
+    tickers = tuple(to_market_ticker_key(symbol) for symbol in symbols)
+    n_sym = len(symbols)
+    cache_key: tuple[Any, ...] = ("multi_source_market_data", tickers, str(interval or "15m"), str(period or "7d"))
+    cached = _yahoo_cache_get(cache_key)
+    if cached is not None and not cached.empty:
+        logger.info("get_market_data: yahoo process-cache HIT key=%s shape=%s", cache_key[0], cached.shape)
+        return cached
+
+    logger.info(
+        "get_market_data: start symbols=%s interval=%s period=%s alpha_key=%s eodhd_key=%s",
+        n_sym,
+        interval,
+        period,
+        bool(ALPHA_API_KEY),
+        bool(EODHD_API_KEY),
+    )
+
+    t_seq = time.perf_counter()
+    frames_by_ticker: dict[str, pd.DataFrame] = {}
+    failed_symbols: list[str] = []
+    yahoo_success = 0
+    alpha_success = 0
+    eodhd_success = 0
+    logged_alpha_limit = False
+
+    with requests.Session() as http_session:
+        # 1) Yahoo batch for all symbols.
+        yahoo_payload = pd.DataFrame()
+        yahoo_iv = _map_interval_to_yahoo(interval)
+        yahoo_period = _map_period_to_yahoo(period)
+        try:
+            if not _yahoo_dns_ok():
+                logger.warning("Yahoo fetch skipped/likely empty: guce.yahoo.com DNS failed in this environment")
+            _yahoo_rate_limit_wait()
+            yahoo_payload = yf.download(
+                tickers=list(tickers),
+                period=yahoo_period,
+                interval=yahoo_iv,
+                auto_adjust=False,
+                group_by="ticker",
+                threads=True,
+                progress=False,
+            )
+            logger.info(
+                "Yahoo batch download complete symbols=%s period=%s interval=%s shape=%s",
+                n_sym,
+                yahoo_period,
+                yahoo_iv,
+                yahoo_payload.shape if isinstance(yahoo_payload, pd.DataFrame) else None,
+            )
+            if isinstance(yahoo_payload, pd.DataFrame) and yahoo_payload.empty:
+                logger.warning(
+                    "Yahoo batch returned empty frame for symbols=%s period=%s interval=%s; "
+                    "if stderr shows 'Could not resolve host: guce.yahoo.com', DNS/network blocks Yahoo consent host.",
+                    n_sym,
+                    yahoo_period,
+                    yahoo_iv,
+                )
+        except Exception as exc:
+            logger.info("Yahoo batch download failed; will use Alpha/EODHD fallback: %s", exc)
+            yahoo_payload = pd.DataFrame()
+
+        missing_after_yahoo: list[tuple[str, str]] = []
+        for raw_sym, ticker in zip(symbols, tickers):
+            frame = _extract_merged_ticker_frame(yahoo_payload, ticker, n_sym)
+            if frame.empty:
+                missing_after_yahoo.append((str(raw_sym), ticker))
+            else:
+                frames_by_ticker[ticker] = frame
+                yahoo_success += 1
+
+        # 2) Alpha fallback for symbols still missing after Yahoo.
+        missing_after_alpha: list[tuple[str, str]] = []
+        for raw_sym, ticker in missing_after_yahoo:
+            frame = pd.DataFrame(columns=OHLCV_COLUMNS)
+            use_alpha_intraday = False
+            if ALPHA_API_KEY and not _ALPHA_INTRADAY_BLOCKED:
+                try:
+                    du = compute_api_usage_display()
+                    if str(du.get("alpha_status")) == "BLOCKED" or int(du.get("alpha_minute_remaining", 0)) <= 0:
+                        use_alpha_intraday = False
+                        if not logged_alpha_limit:
+                            print("Alpha limit reached → using EODHD")
+                            logger.info("Alpha limit reached → using EODHD")
+                            logged_alpha_limit = True
+                    else:
+                        use_alpha_intraday = True
+                except Exception:
+                    use_alpha_intraday = True
+
+            if use_alpha_intraday:
+                try:
+                    frame = _fetch_alpha_intraday(ticker, interval, http_session)
+                except Exception as exc:
+                    logger.info("Alpha Vantage intraday failed for %s: %s", ticker, exc)
+                    frame = pd.DataFrame(columns=OHLCV_COLUMNS)
+                if not frame.empty:
+                    alpha_success += 1
+                    frames_by_ticker[ticker] = frame
+
+            if frame.empty:
+                missing_after_alpha.append((raw_sym, ticker))
+
+        # 3) EODHD fallback for symbols still missing after Alpha (small thread pool).
+        eod_http_total = 0
+        if missing_after_alpha and EODHD_API_KEY:
+            workers = min(EODHD_FALLBACK_MAX_WORKERS, max(1, len(missing_after_alpha)))
+
+            def _eod_one(item: tuple[str, str]) -> tuple[str, str, pd.DataFrame, int]:
+                raw_sym, ticker = item
+                sess = requests.Session()
+                try:
+                    frame, n_http = _fetch_eodhd_intraday_or_daily(
+                        ticker, interval, session=sess, throttle=False
+                    )
+                    return raw_sym, ticker, frame, int(n_http)
+                except Exception as exc:
+                    logger.info("EODHD fetch failed for %s: %s", ticker, exc)
+                    return raw_sym, ticker, pd.DataFrame(columns=OHLCV_COLUMNS), 0
+
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(_eod_one, item) for item in missing_after_alpha]
+                for fut in as_completed(futures):
+                    raw_sym, ticker, frame, nh = fut.result()
+                    eod_http_total += int(nh)
+                    if not frame.empty:
+                        eodhd_success += 1
+                        frames_by_ticker[ticker] = frame
+
+        if eod_http_total:
+            record_eodhd_api_calls(eod_http_total)
+
+        for raw_sym, ticker in missing_after_alpha:
+            frame = frames_by_ticker.get(ticker)
+            if frame is not None and not frame.empty:
+                continue
+            failed_symbols.append(str(raw_sym))
+            logger.info("No OHLC data for %s after Yahoo, Alpha, EODHD", raw_sym)
+
+        # Safety: if Yahoo succeeded but no fallback list was built.
+        if not missing_after_alpha and not missing_after_yahoo and yahoo_success == 0:
+            for raw_sym in symbols:
+                failed_symbols.append(str(raw_sym))
+                logger.info("No OHLC data for %s after Yahoo, Alpha, EODHD", raw_sym)
+
+    print(f"Yahoo success count: {yahoo_success}")
+    print(f"Alpha success count: {alpha_success}")
+    print(f"EODHD success count: {eodhd_success}")
+    if failed_symbols:
+        print(f"Failed symbols: {', '.join(failed_symbols)}")
+    elapsed_seq = time.perf_counter() - t_seq
+    logger.info(
+        "get_market_data: done yahoo_ok=%s alpha_ok=%s eodhd_ok=%s failed=%s elapsed_s=%.2f",
+        yahoo_success,
+        alpha_success,
+        eodhd_success,
+        len(failed_symbols),
+        elapsed_seq,
+    )
+
+    if not frames_by_ticker:
+        logger.warning("get_market_data: pipeline returned no ticker frames")
+        return pd.DataFrame()
+    merged_seq = pd.concat(frames_by_ticker, axis=1, sort=True).sort_index()
+    _yahoo_cache_set(cache_key, merged_seq)
+    logger.info("get_market_data: merged OHLCV shape=%s", merged_seq.shape)
+    return merged_seq
+
+
 def download_market_data(symbols: tuple[str, ...], period: str, interval: str) -> pd.DataFrame:
-    df, _src, _age = get_market_data_with_cache(
+    df, src, age = get_market_data_with_cache(
         symbols,
         str(period or "7d"),
         str(interval or "15m"),
     )
+    shape = df.shape if isinstance(df, pd.DataFrame) else ()
+    logger.info(
+        "download_market_data: done source=%s age_seconds=%.2f shape=%s symbols_requested=%s",
+        src,
+        float(age),
+        shape,
+        len(symbols),
+    )
     return df if isinstance(df, pd.DataFrame) else _safe_empty_market_df()
 
 
-def fetch_index_data(symbol: str = "^NSEI", period: str = "1y", interval: str = "1d") -> pd.DataFrame:
-    try:
-        import yfinance as yf
-    except ImportError as exc:
-        raise RuntimeError("yfinance is not installed. Run pip install -r requirements.txt") from exc
-
-    ticker = to_yahoo_symbol(symbol) if not str(symbol).startswith("^") else symbol
-    cache_key = ("index", ticker, period, interval)
-    cached = _yahoo_cache_get(cache_key)
-    if cached is not None:
-        print("Cache used")
-        data = cached
-    else:
-        def _fetch(use_proxy: bool) -> pd.DataFrame:
-            _yahoo_rate_limit_wait()
-            if use_proxy:
-                print("Proxy fallback")
-                return yf.download(
-                    tickers=ticker,
-                    period=period,
-                    interval=interval,
-                    auto_adjust=False,
-                    progress=False,
-                    threads=False,
-                )
-
-            print("Direct fetch")
-            proxy_keys = (
-                "http_proxy",
-                "https_proxy",
-                "HTTP_PROXY",
-                "HTTPS_PROXY",
-                "all_proxy",
-                "ALL_PROXY",
-                "socks_proxy",
-                "SOCKS_PROXY",
-                "socks5_proxy",
-                "SOCKS5_PROXY",
-                "GIT_HTTP_PROXY",
-                "GIT_HTTPS_PROXY",
-            )
-            previous_env: dict[str, str] = {}
-            try:
-                for key in proxy_keys:
-                    value = os.environ.pop(key, None)
-                    if value is not None:
-                        previous_env[key] = value
-                return yf.download(
-                    tickers=ticker,
-                    period=period,
-                    interval=interval,
-                    auto_adjust=False,
-                    progress=False,
-                    threads=False,
-                )
-            finally:
-                for key, value in previous_env.items():
-                    os.environ[key] = value
-
-        direct_error: Exception | None = None
-        data = pd.DataFrame()
-        try:
-            data = _fetch(use_proxy=False)
-        except Exception as exc:
-            direct_error = exc
-
-        if (data.empty or data.dropna(how="all").empty) and direct_error is not None and _is_http_429_error(direct_error):
-            try:
-                data = _fetch(use_proxy=True)
-            except Exception as exc:
-                logger.info("Yahoo index proxy fallback failed for %s: %s", symbol, exc)
-
-        if data.empty:
-            if direct_error is not None:
-                logger.info("Yahoo index direct fetch failed for %s: %s", symbol, direct_error)
-            raise RuntimeError(f"No data returned from Yahoo Finance for {symbol}")
-
-        _yahoo_cache_set(cache_key, data)
-
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-
-    data = data.rename(columns=str.title)
-    missing_columns = [column for column in OHLCV_COLUMNS if column not in data.columns]
-    if missing_columns:
-        raise RuntimeError(f"Index data missing columns for {symbol}: {', '.join(missing_columns)}")
-
-    data = data[OHLCV_COLUMNS].copy()
-    for column in OHLCV_COLUMNS:
-        data[column] = pd.to_numeric(data[column], errors="coerce")
-
-    cleaned = data.dropna(subset=["Open", "High", "Low", "Close"])
-    if cleaned.empty:
-        raise RuntimeError(f"Index response had no valid OHLC rows for {symbol}")
-    return cleaned
-
-
-def _yahoo_cache_get(key: tuple[Any, ...]) -> pd.DataFrame | None:
-    entry = _YAHOO_FETCH_CACHE.get(key)
-    if not entry:
-        return None
-    ts, value = entry
-    if (time.time() - ts) > YAHOO_FETCH_CACHE_TTL_SECONDS:
-        _YAHOO_FETCH_CACHE.pop(key, None)
-        return None
-    return value.copy()
-
-
-def _yahoo_cache_set(key: tuple[Any, ...], value: pd.DataFrame) -> None:
-    _YAHOO_FETCH_CACHE[key] = (time.time(), value.copy())
-
-
 def clear_market_data_cache() -> None:
-    global _YAHOO_LAST_CALL_TS, _ALPHA_LAST_CALL_TS, _EODHD_LAST_CALL_TS
-    _YAHOO_FETCH_CACHE.clear()
-    _YAHOO_LAST_CALL_TS = 0.0
+    global _ALPHA_LAST_CALL_TS, _EODHD_LAST_CALL_TS, _YAHOO_LAST_CALL_TS
+    global _ALPHA_INTRADAY_BLOCKED, _EODHD_NSE_EXCHANGE_SUFFIX
     _ALPHA_LAST_CALL_TS = 0.0
     _EODHD_LAST_CALL_TS = 0.0
+    _YAHOO_LAST_CALL_TS = 0.0
+    _ALPHA_INTRADAY_BLOCKED = False
+    _EODHD_NSE_EXCHANGE_SUFFIX = None
+    with _YAHOO_CACHE_LOCK:
+        _YAHOO_FETCH_CACHE.clear()
+    logger.info("Market cache: clear requested (session cache + disk meta/pickle)")
     try:
         st.session_state["market_cache"] = {"data": None, "timestamp": 0.0, "params": None}
         st.session_state[MARKET_FETCH_META_KEY] = {"source": "FAILED", "age_seconds": 0.0, "ts": time.time()}
     except Exception:
         pass
+    try:
+        if MARKET_API_META_PATH.exists():
+            MARKET_API_META_PATH.unlink()
+    except OSError:
+        logger.info("Could not remove market_api_meta.json during cache clear", exc_info=True)
+    try:
+        if MARKET_CACHE_DF_PATH.exists():
+            MARKET_CACHE_DF_PATH.unlink()
+    except OSError:
+        logger.info("Could not remove market_cache_latest.pkl during cache clear", exc_info=True)
+
+
+def _canonical_market_download_params(symbols: list[str], period: str, interval: str) -> tuple[list[str], str, str]:
+    """Match download_market_data / get_market_data_with_cache period & interval fallbacks."""
+    period_s = str(period or "7d")
+    interval_s = str(interval or "15m")
+    return list(symbols), period_s, interval_s
+
+
+def _market_symbols_key(symbols: list[str] | tuple[str, ...]) -> str:
+    return "|".join(sorted(str(s) for s in symbols))
+
+
+def _write_market_api_live_meta(symbols: tuple[str, ...], period_s: str, interval_s: str, epoch: float) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "last_live_epoch": float(epoch),
+            "symbols": list(symbols),
+            "symbols_key": _market_symbols_key(symbols),
+            "period": period_s,
+            "interval": interval_s,
+        }
+        MARKET_API_META_PATH.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        logger.debug(
+            "Market cache: wrote API meta last_live_epoch=%s symbols_key=%s",
+            payload.get("last_live_epoch"),
+            payload.get("symbols_key"),
+        )
+    except OSError:
+        logger.info("Could not write market_api_meta.json", exc_info=True)
+
+
+def _read_market_api_live_meta() -> dict[str, Any] | None:
+    if not MARKET_API_META_PATH.exists():
+        return None
+    try:
+        raw = json.loads(MARKET_API_META_PATH.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_market_cache_df_to_disk(df: pd.DataFrame) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_pickle(MARKET_CACHE_DF_PATH)
+        logger.info(
+            "Market cache: wrote disk pickle path=%s shape=%s",
+            MARKET_CACHE_DF_PATH,
+            df.shape,
+        )
+    except OSError:
+        logger.info("Could not write market_cache_latest.pkl", exc_info=True)
+
+
+def _read_market_cache_df_from_disk() -> pd.DataFrame | None:
+    if not MARKET_CACHE_DF_PATH.exists():
+        return None
+    try:
+        obj = pd.read_pickle(MARKET_CACHE_DF_PATH)
+        if isinstance(obj, pd.DataFrame) and not obj.empty:
+            logger.info(
+                "Market cache: read disk pickle path=%s shape=%s",
+                MARKET_CACHE_DF_PATH,
+                obj.shape,
+            )
+        return obj if isinstance(obj, pd.DataFrame) else None
+    except Exception:
+        logger.info("Could not read market_cache_latest.pkl", exc_info=True)
+        return None
+
+
+def _disk_meta_matches_scan(meta: dict[str, Any], symbols: list[str], period: str, interval: str) -> bool:
+    sym_c, ps, ins = _canonical_market_download_params(symbols, period, interval)
+    if str(meta.get("period") or "") != ps or str(meta.get("interval") or "") != ins:
+        return False
+    key = _market_symbols_key(sym_c)
+    if str(meta.get("symbols_key") or "") == key:
+        return True
+    return list(meta.get("symbols") or []) == sym_c
 
 
 def _init_market_session_cache() -> None:
@@ -811,8 +1334,11 @@ def get_market_data_with_cache(
     interval: str,
 ) -> tuple[pd.DataFrame, str, float]:
     """
-    Short-lived session cache (60s) around get_market_data. Returns (df, source, age_seconds).
-    Never raises; never returns None.
+    Market OHLCV cache for get_market_data (Yahoo batch → Alpha gaps → EODHD gaps, as implemented there).
+
+    - MARKET_SESSION_CACHE_TTL (seconds): in-process + disk snapshot; no new provider calls
+      while (now - last_live_epoch) < TTL unless MARKET_FORCE_NEXT_KEY forces refresh.
+    - Disk: MARKET_API_META_PATH (last LIVE epoch + params) + MARKET_CACHE_DF_PATH (pickle).
     """
     _init_market_session_cache()
     now = time.time()
@@ -832,6 +1358,40 @@ def get_market_data_with_cache(
     except Exception:
         force_refresh = False
 
+    logger.info(
+        "get_market_data_with_cache: entry symbol_count=%s period=%s interval=%s force_refresh=%s ttl_s=%s",
+        len(symbols),
+        period_s,
+        interval_s,
+        force_refresh,
+        MARKET_SESSION_CACHE_TTL,
+    )
+
+    # Reload last LIVE snapshot from disk (new browser session / refresh) — no Alpha/EODHD
+    # until TTL expires or user forces refresh.
+    if not force_refresh:
+        dm = _read_market_api_live_meta()
+        if dm and _disk_meta_matches_scan(dm, list(symbols), period, interval):
+            live_ts = float(dm.get("last_live_epoch") or 0.0)
+            if live_ts > 0 and (now - live_ts) < float(MARKET_SESSION_CACHE_TTL):
+                on_disk = _read_market_cache_df_from_disk()
+                if isinstance(on_disk, pd.DataFrame) and not on_disk.empty:
+                    cache["data"] = on_disk.copy()
+                    cache["timestamp"] = live_ts
+                    cache["params"] = params_key
+                    age = max(0.0, now - live_ts)
+                    _write_meta("CACHE", age)
+                    logger.info(
+                        "get_market_data_with_cache: CACHE from disk pickle + meta (no API) age_s=%.2f shape=%s",
+                        age,
+                        on_disk.shape,
+                    )
+                    return on_disk.copy(), "CACHE", age
+                logger.warning(
+                    "get_market_data_with_cache: disk meta TTL valid but pickle missing/empty — will refetch if needed path=%s",
+                    MARKET_CACHE_DF_PATH,
+                )
+
     quota_low = False
     try:
         if ALPHA_API_KEY:
@@ -839,6 +1399,9 @@ def get_market_data_with_cache(
             if int(usage_view.get("alpha_minute_remaining", 99)) <= 1:
                 quota_low = True
                 st.session_state[MARKET_QUOTA_FLAG_KEY] = True
+                logger.info(
+                    "get_market_data_with_cache: Alpha minute quota nearly exhausted — prefer cache over new API calls"
+                )
     except Exception:
         pass
 
@@ -866,9 +1429,17 @@ def get_market_data_with_cache(
         ):
             src = "CACHE" if age_from_cache_ts < MARKET_SESSION_CACHE_TTL else "STALE_CACHE"
             _write_meta(src, age_from_cache_ts)
+            logger.info(
+                "get_market_data_with_cache: serving %s (quota_low) age_s=%.2f shape=%s — no new API",
+                src,
+                age_from_cache_ts,
+                cached_data.shape,
+            )
             return cached_data.copy(), src, age_from_cache_ts
-        _write_meta("FAILED", 0.0)
-        return _safe_empty_market_df(), "FAILED", 0.0
+        logger.warning(
+            "get_market_data_with_cache: Alpha quota low and no matching cache; continuing to LIVE fetch "
+            "so Yahoo/EODHD can still provide data."
+        )
 
     if (
         not force_refresh
@@ -879,15 +1450,27 @@ def get_market_data_with_cache(
     ):
         age = max(0.0, now - cached_ts)
         _write_meta("CACHE", age)
+        logger.info(
+            "get_market_data_with_cache: CACHE from in-process session age_s=%.2f shape=%s — no API",
+            age,
+            cached_data.shape,
+        )
         return cached_data.copy(), "CACHE", age
 
+    if force_refresh:
+        logger.info("get_market_data_with_cache: force_refresh set — calling providers (ignoring TTL cache)")
+
     fresh: pd.DataFrame = _safe_empty_market_df()
+    logger.info(
+        "get_market_data_with_cache: cache miss or stale — calling get_market_data for %s symbols",
+        len(symbols),
+    )
     try:
         got = get_market_data(tuple(symbols), interval=interval_s, period=period_s)
         if isinstance(got, pd.DataFrame):
             fresh = got
     except Exception as exc:
-        logger.info("get_market_data failed: %s", exc)
+        logger.warning("get_market_data_with_cache: get_market_data raised: %s", exc, exc_info=True)
         fresh = _safe_empty_market_df()
 
     if isinstance(fresh, pd.DataFrame) and not fresh.empty:
@@ -895,30 +1478,113 @@ def get_market_data_with_cache(
         cache["timestamp"] = now
         cache["params"] = params_key
         _write_meta("LIVE", 0.0)
+        _write_market_api_live_meta(tuple(symbols), period_s, interval_s, now)
+        _write_market_cache_df_to_disk(fresh)
+        logger.info(
+            "get_market_data_with_cache: LIVE provider data stored session+disk shape=%s",
+            fresh.shape,
+        )
         return fresh.copy(), "LIVE", 0.0
 
     if cached_data is not None and isinstance(cached_data, pd.DataFrame) and cached_params == params_key and not cached_data.empty:
         _write_meta("STALE_CACHE", age_from_cache_ts)
+        logger.info(
+            "get_market_data_with_cache: live fetch empty; STALE_CACHE fallback age_s=%.2f shape=%s",
+            age_from_cache_ts,
+            cached_data.shape,
+        )
         return cached_data.copy(), "STALE_CACHE", age_from_cache_ts
 
     _write_meta("FAILED", 0.0)
+    logger.warning("get_market_data_with_cache: FAILED — empty live result and no stale cache")
     return _safe_empty_market_df(), "FAILED", 0.0
 
 
-def _ensure_api_usage_state() -> dict[str, Any]:
-    if API_USAGE_STATE_KEY not in st.session_state:
-        now = time.time()
+def _ensure_market_cache_after_scan(
+    symbols: list[str],
+    period: str,
+    interval: str,
+    use_sample_data: bool,
+) -> None:
+    """
+    If scan_symbols hit @st.cache_data and skipped download, session market_cache may be empty.
+    Refill via download_market_data unless disk meta shows a recent LIVE fetch for the same
+    scan params (then skip API — UI uses disk timestamp in render_market_data_cache_status_bar).
+    """
+    if use_sample_data or not symbols:
+        logger.info(
+            "Post-scan market cache sync: skipped (use_sample_data=%s symbols=%s)",
+            use_sample_data,
+            bool(symbols),
+        )
+        return
+    try:
+        _init_market_session_cache()
+        ts = float(st.session_state.market_cache.get("timestamp") or 0.0)
+        if ts > 0:
+            logger.info("Post-scan market cache sync: skipped (session cache timestamp already set)")
+            return
+        disk = _read_market_api_live_meta()
+        if disk and _disk_meta_matches_scan(disk, symbols, period, interval):
+            live_ts = float(disk.get("last_live_epoch") or 0.0)
+            if live_ts > 0 and (time.time() - live_ts) < float(MARKET_SESSION_CACHE_TTL):
+                logger.info(
+                    "Post-scan market cache sync: skipped (disk LIVE meta still within TTL, age_s=%.2f)",
+                    time.time() - live_ts,
+                )
+                return
+        logger.info(
+            "Post-scan market cache sync: calling download_market_data for %s symbols",
+            len(symbols),
+        )
+        download_market_data(tuple(symbols), period, interval)
+    except Exception:
+        logger.warning("Post-scan market cache sync failed", exc_info=True)
+
+
+def _normalize_api_usage_from_disk(raw: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        a = raw.get("alpha")
+        e = raw.get("eodhd")
+        if not isinstance(a, dict) or not isinstance(e, dict):
+            return None
         today = datetime.now().date().isoformat()
-        st.session_state[API_USAGE_STATE_KEY] = {
+        now = time.time()
+        return {
             "alpha": {
-                "minute_calls": 0,
-                "day_calls": 0,
-                "last_reset_minute": now,
-                "last_reset_day": today,
+                "minute_calls": max(0, int(a.get("minute_calls", 0))),
+                "day_calls": max(0, int(a.get("day_calls", 0))),
+                "last_reset_minute": float(a.get("last_reset_minute", now)),
+                "last_reset_day": str(a.get("last_reset_day") or today),
             },
-            "eodhd": {"minute_calls": 0, "last_reset_minute": now},
+            "eodhd": {
+                "minute_calls": max(0, int(e.get("minute_calls", 0))),
+                "last_reset_minute": float(e.get("last_reset_minute", now)),
+            },
         }
-    return st.session_state[API_USAGE_STATE_KEY]
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_api_usage_state_from_disk() -> dict[str, Any] | None:
+    if not API_USAGE_PERSIST_PATH.exists():
+        return None
+    try:
+        raw = json.loads(API_USAGE_PERSIST_PATH.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _persist_api_usage_state() -> None:
+    try:
+        usage = st.session_state.get(API_USAGE_STATE_KEY)
+        if not isinstance(usage, dict):
+            return
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        API_USAGE_PERSIST_PATH.write_text(json.dumps(usage, separators=(",", ":")), encoding="utf-8")
+    except OSError:
+        logger.info("Could not persist api_usage_state.json", exc_info=True)
 
 
 def _apply_api_usage_window_resets(usage: dict[str, Any]) -> None:
@@ -938,11 +1604,34 @@ def _apply_api_usage_window_resets(usage: dict[str, Any]) -> None:
         e["last_reset_minute"] = now
 
 
+def _ensure_api_usage_state() -> dict[str, Any]:
+    if API_USAGE_STATE_KEY not in st.session_state:
+        loaded_raw = _load_api_usage_state_from_disk()
+        normalized = _normalize_api_usage_from_disk(loaded_raw) if loaded_raw else None
+        if normalized is not None:
+            _apply_api_usage_window_resets(normalized)
+            st.session_state[API_USAGE_STATE_KEY] = normalized
+        else:
+            now = time.time()
+            today = datetime.now().date().isoformat()
+            st.session_state[API_USAGE_STATE_KEY] = {
+                "alpha": {
+                    "minute_calls": 0,
+                    "day_calls": 0,
+                    "last_reset_minute": now,
+                    "last_reset_day": today,
+                },
+                "eodhd": {"minute_calls": 0, "last_reset_minute": now},
+            }
+    return st.session_state[API_USAGE_STATE_KEY]
+
+
 def record_alpha_api_call() -> None:
     usage = _ensure_api_usage_state()
     _apply_api_usage_window_resets(usage)
     usage["alpha"]["minute_calls"] += 1
     usage["alpha"]["day_calls"] += 1
+    _persist_api_usage_state()
 
 
 def record_eodhd_api_calls(count: int) -> None:
@@ -951,6 +1640,7 @@ def record_eodhd_api_calls(count: int) -> None:
     usage = _ensure_api_usage_state()
     _apply_api_usage_window_resets(usage)
     usage["eodhd"]["minute_calls"] += int(count)
+    _persist_api_usage_state()
 
 
 def compute_api_usage_display() -> dict[str, Any]:
@@ -984,7 +1674,7 @@ def compute_api_usage_display() -> dict[str, Any]:
     elif e_rem <= 1:
         eodhd_status = "WARNING"
 
-    return {
+    out = {
         "alpha_minute_used": am,
         "alpha_minute_cap": ALPHA_API_MINUTE_LIMIT,
         "alpha_minute_remaining": max(0, min_rem),
@@ -993,14 +1683,73 @@ def compute_api_usage_display() -> dict[str, Any]:
         "alpha_day_remaining": max(0, day_rem),
         "alpha_status": alpha_status,
         "alpha_next_safe_sec": alpha_next_safe_sec,
+        "alpha_last_reset_epoch": float(a["last_reset_minute"]),
         "eodhd_minute_used": em,
         "eodhd_minute_cap": EODHD_API_MINUTE_LIMIT,
         "eodhd_minute_remaining": max(0, e_rem),
         "eodhd_status": eodhd_status,
         "eodhd_next_safe_sec": eodhd_next_safe_sec,
+        "eodhd_last_reset_epoch": float(e["last_reset_minute"]),
+        "server_now_epoch": now,
         "alpha_refresh_blocked": alpha_status == "BLOCKED",
         "refresh_blocked": alpha_status == "BLOCKED" or eodhd_status == "BLOCKED",
     }
+    _persist_api_usage_state()
+    return out
+
+
+def _render_api_minute_bucket_live_row(d: dict[str, Any]) -> None:
+    """Live-updating minute-bucket countdown under Alpha / EODHD (no Streamlit rerun)."""
+    has_alpha = bool(ALPHA_API_KEY)
+    has_eod = bool(EODHD_API_KEY)
+    if not has_alpha and not has_eod:
+        return
+
+    cfg = {
+        "has_alpha": has_alpha,
+        "has_eod": has_eod,
+        "alpha_last": float(d.get("alpha_last_reset_epoch", 0.0)),
+        "eod_last": float(d.get("eodhd_last_reset_epoch", 0.0)),
+        "server_now": float(d.get("server_now_epoch", time.time())),
+    }
+    cfg_json = json.dumps(cfg, separators=(",", ":")).replace("<", "\\u003c")
+
+    html = """
+<script type="application/json" id="api-bucket-cfg">""" + cfg_json + """</script>
+<style>.api-bucket-row{font-family:system-ui,sans-serif;font-size:0.92rem;color:#eceff1;margin-top:4px;
+  padding:10px 12px;background:#262730;border:1px solid #464b5e;border-radius:8px;display:flex;gap:20px;flex-wrap:wrap;}
+.api-bucket-row .col{flex:1;min-width:140px;}</style>
+<div class="api-bucket-row">
+  <div class="col" id="alphaBucketCol" style="display:none;"><strong>Alpha Vantage</strong><br/>
+    Next minute-bucket reset in <span id="apiAlphaSec">—</span> s</div>
+  <div class="col" id="eodBucketCol" style="display:none;"><strong>EODHD</strong><br/>
+    Next minute-bucket reset in <span id="apiEodSec">—</span> s</div>
+</div>
+<script>
+(function(){
+  var cfg = {};
+  try { cfg = JSON.parse(document.getElementById("api-bucket-cfg").textContent || "{}"); } catch (e) {}
+  var hasA = !!cfg.has_alpha, hasE = !!cfg.has_eod;
+  var alphaLast = Number(cfg.alpha_last) || 0, eodLast = Number(cfg.eod_last) || 0;
+  var serverNow = Number(cfg.server_now) || 0;
+  var clientAt = Date.now() / 1000;
+  var skew = serverNow > 0 ? (serverNow - clientAt) : 0;
+  function now(){ return Date.now() / 1000 + skew; }
+  function rem60(t0){ var e = Math.max(0, now() - t0); return Math.max(0, 60 - e); }
+  var aCol = document.getElementById("alphaBucketCol"), eCol = document.getElementById("eodBucketCol");
+  var aEl = document.getElementById("apiAlphaSec"), eEl = document.getElementById("apiEodSec");
+  if (hasA) { aCol.style.display = "block"; }
+  if (hasE) { eCol.style.display = "block"; }
+  function tick(){
+    if (hasA && aEl) aEl.textContent = String(Math.max(0, Math.ceil(rem60(alphaLast))));
+    if (hasE && eEl) eEl.textContent = String(Math.max(0, Math.ceil(rem60(eodLast))));
+  }
+  tick();
+  setInterval(tick, 500);
+})();
+</script>
+"""
+    components.html(html, height=110, scrolling=False)
 
 
 def render_api_usage_panel() -> None:
@@ -1035,7 +1784,6 @@ def render_api_usage_panel() -> None:
             st.caption(
                 f"Day: {d['alpha_day_used']}/{d['alpha_day_cap']} used · {d['alpha_day_remaining']} remaining"
             )
-            st.caption(f"Next minute-bucket reset in ~{int(np.ceil(d['alpha_next_safe_sec']))}s")
         else:
             st.markdown("**Alpha Vantage**")
             st.caption("API key not configured.")
@@ -1046,10 +1794,11 @@ def render_api_usage_panel() -> None:
                 f"Minute: {d['eodhd_minute_used']}/{d['eodhd_minute_cap']} used · "
                 f"{d['eodhd_minute_remaining']} remaining (buffer limit)"
             )
-            st.caption(f"Next minute-bucket reset in ~{int(np.ceil(d['eodhd_next_safe_sec']))}s")
         else:
             st.markdown("**EODHD**")
             st.caption("API key not configured.")
+
+    _render_api_minute_bucket_live_row(d)
 
     if d["alpha_status"] in ("WARNING", "BLOCKED") or d["eodhd_status"] in ("WARNING", "BLOCKED"):
         wait_candidates: list[int] = []
@@ -1061,38 +1810,99 @@ def render_api_usage_panel() -> None:
         st.warning(f"⚠️ Avoid refreshing for **{wait_s}** seconds (API window resets).")
 
 
-def render_market_data_cache_status_bar() -> None:
-    """Market cache: frontend-only live TTL bar, colors, warning blink, reload button (no timer-driven Python reruns)."""
+def render_market_data_cache_status_bar(
+    symbols: list[str],
+    period: str,
+    interval: str,
+    use_sample_data: bool,
+) -> None:
+    """
+    Market bar: timer / bar / force button use last LIVE API epoch from this session when set,
+    otherwise from persisted disk meta (same symbols+period+interval) so browser refresh does
+    not reset the clock unless TTL expired or a new fetch ran.
+    """
+    if use_sample_data:
+        st.markdown("##### Market data")
+        st.caption("Sample mode: no live market API timer.")
+        return
+
     try:
+        _init_market_session_cache()
         mc = st.session_state.get("market_cache") or {}
     except Exception:
         mc = {}
-    last_updated = float(mc.get("timestamp") or 0.0)
+    ts_sess = float(mc.get("timestamp") or 0.0)
 
     try:
         meta = st.session_state.get(MARKET_FETCH_META_KEY) or {}
     except Exception:
         meta = {}
-    source = str(meta.get("source", "FAILED"))
+    source_sess = str(meta.get("source", "FAILED"))
+
+    disk = _read_market_api_live_meta()
+    disk_match = bool(disk and symbols and _disk_meta_matches_scan(disk, symbols, period, interval))
+    disk_ts = float(disk.get("last_live_epoch") or 0.0) if disk_match else 0.0
+
+    # Prefer latest LIVE time across session + disk so a browser refresh does not "restart" the
+    # clock when this run did not fetch but disk still has a fresh last_live_epoch (symbols_key match).
+    if disk_match and disk_ts > 0:
+        if ts_sess > 0:
+            last_api_refresh_epoch = max(ts_sess, disk_ts)
+            used_persisted_timer = False
+            source = source_sess
+        else:
+            last_api_refresh_epoch = disk_ts
+            used_persisted_timer = True
+            source = "CACHE"
+    elif ts_sess > 0:
+        last_api_refresh_epoch = ts_sess
+        used_persisted_timer = False
+        source = source_sess
+    else:
+        last_api_refresh_epoch = 0.0
+        used_persisted_timer = False
+        source = source_sess
 
     try:
         quota_low = bool(st.session_state.get(MARKET_QUOTA_FLAG_KEY))
     except Exception:
         quota_low = False
 
-    ttl = int(MARKET_SESSION_CACHE_TTL)
-    lu_js = json.dumps(last_updated)
-    src_js = json.dumps(source)
-    quota_js = "true" if quota_low else "false"
+    server_now_epoch = time.time()
+    ttl_sec = float(MARKET_SESSION_CACHE_TTL)
+    force_enable_sec = int(MARKET_FORCE_REFRESH_ENABLE_REMAINING_SEC)
+    warn_sec = int(MARKET_UI_WARNING_REMAINING_SEC)
+
+    cfg = {
+        "last_api_refresh_epoch": last_api_refresh_epoch,
+        "server_now_epoch": server_now_epoch,
+        "cache_ttl_seconds": ttl_sec,
+        "force_enable_remaining_sec": force_enable_sec,
+        "warning_remaining_sec": warn_sec,
+        "source": source,
+        "quota_low": quota_low,
+        "used_persisted_timer": used_persisted_timer,
+    }
+    cfg_json = json.dumps(cfg, separators=(",", ":")).replace("<", "\\u003c")
 
     st.markdown("##### Market data")
     html_fragment = """
-<div style="font-family:sans-serif;font-size:14px;margin:4px 0 12px 0;">
-  <div id="sourceLine" style="font-weight:600;margin-bottom:6px;"></div>
-  <div id="quotaLine" style="display:none;margin-bottom:8px;color:#b8860b;"></div>
-  <div id="statusText"></div>
+<style>
+  .mc-timer-root { font-family: system-ui, sans-serif; font-size: 14px; margin: 4px 0 12px 0;
+    padding: 12px 14px; border-radius: 10px;
+    background: #262730; color: #eceff1; border: 1px solid #464b5e;
+    box-sizing: border-box; }
+  .mc-timer-root #statusText { color: #eceff1 !important; font-size: 0.95rem; line-height: 1.5;
+    letter-spacing: 0.01em; }
+  .mc-timer-track { background: #3d4454 !important; border-radius: 10px; height: 12px; overflow: hidden; }
+</style>
+<div class="mc-timer-root">
+  <div id="sourceLine" style="font-weight:600;margin-bottom:8px;"></div>
+  <div id="persistNote" style="display:none;font-size:0.82rem;color:#90caf9;margin-bottom:6px;"></div>
+  <div id="quotaLine" style="display:none;margin-bottom:8px;color:#ffcc80;"></div>
+  <div id="statusText" style="color:#eceff1;"></div>
   <div style="margin-top:10px;">
-    <div style="background:#eee; border-radius:10px; height:12px; overflow:hidden;">
+    <div class="mc-timer-track">
       <div id="progressBar" style="
         height:12px;
         width:100%;
@@ -1101,7 +1911,7 @@ def render_market_data_cache_status_bar() -> None:
       "></div>
     </div>
   </div>
-  <div id="warningText" style="margin-top:10px; font-weight:bold; min-height:1.2em;"></div>
+  <div id="warningText" style="margin-top:10px; font-weight:bold; min-height:1.2em; color:#ffab91;"></div>
   <button id="refreshBtn" disabled style="
     margin-top:10px;
     padding:6px 12px;
@@ -1114,26 +1924,48 @@ def render_market_data_cache_status_bar() -> None:
     🔄 Force Refresh
   </button>
 </div>
+<script type="application/json" id="mc-api-timer-cfg">""" + cfg_json + """</script>
 <script>
 (function () {
-  const TTL = """ + str(ttl) + """;
-  const lastUpdated = """ + lu_js + """;
-  const source = """ + src_js + """;
-  const quotaLow = """ + quota_js + """;
+  let cfg;
+  try {
+    cfg = JSON.parse(document.getElementById("mc-api-timer-cfg").textContent || "{}");
+  } catch (e) {
+    cfg = {};
+  }
+  const lastApi = Number(cfg.last_api_refresh_epoch) || 0;
+  const serverNowEmbed = Number(cfg.server_now_epoch) || 0;
+  const TTL = Number(cfg.cache_ttl_seconds) || 90;
+  const forceEnableRem = Number(cfg.force_enable_remaining_sec) || 30;
+  const warnRem = Number(cfg.warning_remaining_sec) || 15;
+  const source = String(cfg.source || "FAILED");
+  const quotaLow = !!cfg.quota_low;
+  const usedPersisted = !!cfg.used_persisted_timer;
+
+  const clientAtEmbed = Date.now() / 1000;
+  const serverSkew = serverNowEmbed > 0 ? (serverNowEmbed - clientAtEmbed) : 0;
+  function apiNow() {
+    return Date.now() / 1000 + serverSkew;
+  }
 
   const sourceLine = document.getElementById("sourceLine");
+  const persistNote = document.getElementById("persistNote");
   const quotaLine = document.getElementById("quotaLine");
+  if (usedPersisted) {
+    persistNote.style.display = "block";
+    persistNote.innerText = "Timer from last server-side API fetch (no new request this page load).";
+  }
   if (source === "LIVE") {
-    sourceLine.style.color = "#1b5e20";
+    sourceLine.style.color = "#a5d6a7";
     sourceLine.innerText = "✅ Live data fetched";
   } else if (source === "CACHE") {
-    sourceLine.style.color = "#b8860b";
+    sourceLine.style.color = "#ffe082";
     sourceLine.innerText = "⚠️ Showing cached data (API not called)";
   } else if (source === "STALE_CACHE") {
-    sourceLine.style.color = "#e65100";
+    sourceLine.style.color = "#ffab91";
     sourceLine.innerText = "⚠️ API failed, showing last available data";
   } else {
-    sourceLine.style.color = "#c62828";
+    sourceLine.style.color = "#ff8a80";
     sourceLine.innerText = "🚫 No data available";
   }
   if (quotaLow) {
@@ -1158,10 +1990,10 @@ def render_market_data_cache_status_bar() -> None:
   let lastSecTick = -1;
 
   function updateUI() {
-    const now = Date.now() / 1000;
+    const now = apiNow();
     let elapsed = 0;
-    if (lastUpdated > 0) {
-      elapsed = Math.max(0, now - lastUpdated);
+    if (lastApi > 0) {
+      elapsed = Math.max(0, now - lastApi);
     }
     let remaining = TTL - elapsed;
     if (remaining < 0) remaining = 0;
@@ -1169,19 +2001,20 @@ def render_market_data_cache_status_bar() -> None:
     const secTick = Math.floor(now);
     if (secTick !== lastSecTick) {
       lastSecTick = secTick;
-      if (lastUpdated <= 0) {
-        statusEl.innerText = "Last updated: — | Next refresh in: 0 sec";
+      if (lastApi <= 0) {
+        statusEl.innerText = "Last API refresh: — | Next API refresh in: 0 sec";
       } else {
         statusEl.innerText =
-          "Last updated: " + Math.floor(elapsed) + " sec ago | Next refresh in: " + Math.floor(remaining) + " sec";
+          "Last API refresh: " + Math.floor(elapsed) + " sec ago | Next API refresh in: " + Math.floor(remaining) + " sec";
       }
+      statusEl.style.color = "#eceff1";
     }
 
     const percent = TTL > 0 ? (remaining / TTL) * 100 : 0;
     bar.style.width = percent + "%";
     bar.style.backgroundColor = getColor(percent);
 
-    if (remaining <= 15 && lastUpdated > 0) {
+    if (remaining <= warnRem && lastApi > 0) {
       warning.innerText = "⚠️ Refresh available soon!";
       warning.style.color = "red";
       warning.style.visibility = (Math.floor(now) % 2 === 0) ? "visible" : "hidden";
@@ -1190,7 +2023,7 @@ def render_market_data_cache_status_bar() -> None:
       warning.style.visibility = "visible";
     }
 
-    if (remaining <= 30) {
+    if (remaining <= forceEnableRem) {
       btn.disabled = false;
       btn.style.cursor = "pointer";
       btn.style.background = "#2e7d32";
@@ -1215,21 +2048,7 @@ def render_market_data_cache_status_bar() -> None:
 })();
 </script>
 """
-    components.html(html_fragment, height=260, scrolling=False)
-
-
-def _yahoo_rate_limit_wait() -> None:
-    global _YAHOO_LAST_CALL_TS
-    now = time.monotonic()
-    elapsed = now - _YAHOO_LAST_CALL_TS
-    if elapsed < YAHOO_MIN_CALL_GAP_SECONDS:
-        time.sleep(YAHOO_MIN_CALL_GAP_SECONDS - elapsed)
-    _YAHOO_LAST_CALL_TS = time.monotonic()
-
-
-def _is_http_429_error(exc: Exception) -> bool:
-    message = str(exc)
-    return "429" in message or "Too Many Requests" in message
+    components.html(html_fragment, height=290, scrolling=False)
 
 
 def _nse_corporates_pit_records(payload: Any) -> list[dict[str, Any]]:
@@ -1593,12 +2412,12 @@ def make_sample_history(symbol: str, periods: int = 180) -> pd.DataFrame:
 
 
 def extract_symbol_history(market_data: pd.DataFrame, symbol: str, total_symbols: int) -> pd.DataFrame:
-    yahoo_symbol = to_yahoo_symbol(symbol)
+    ticker_key = to_market_ticker_key(symbol)
 
     if total_symbols == 1 and not isinstance(market_data.columns, pd.MultiIndex):
         data = market_data.copy()
-    elif isinstance(market_data.columns, pd.MultiIndex) and yahoo_symbol in market_data.columns.get_level_values(0):
-        data = market_data[yahoo_symbol].copy()
+    elif isinstance(market_data.columns, pd.MultiIndex) and ticker_key in market_data.columns.get_level_values(0):
+        data = market_data[ticker_key].copy()
     elif isinstance(market_data.columns, pd.MultiIndex) and symbol in market_data.columns.get_level_values(0):
         data = market_data[symbol].copy()
     else:
@@ -1725,9 +2544,9 @@ def classify_index_trend(data: pd.DataFrame, config: StrategyConfig) -> tuple[st
 
 
 def _fetch_regime_history(symbol: str) -> pd.DataFrame:
-    yahoo_symbol = to_yahoo_symbol(symbol)
+    ticker_key = to_market_ticker_key(symbol)
     payload = get_market_data((symbol,), interval="15m", period="7d")
-    return _extract_yahoo_symbol_frame(payload, yahoo_symbol, total=1)
+    return _extract_merged_ticker_frame(payload, ticker_key, total=1)
 
 
 def _trend_score(trend: str) -> int:
@@ -2887,6 +3706,14 @@ def scan_symbols(
     if not symbols:
         return empty_futures_table(), ["No symbols available to scan"]
 
+    logger.info(
+        "scan_symbols: start symbol_count=%s use_sample_data=%s nonce=%s period=%s interval=%s",
+        len(symbols),
+        use_sample_data,
+        market_refresh_nonce,
+        period,
+        interval,
+    )
     rows = []
     errors = []
     no_data_symbols: list[str] = []
@@ -2895,11 +3722,18 @@ def scan_symbols(
     if not use_sample_data:
         try:
             market_data = download_market_data(tuple(symbols), period, interval)
+            logger.info(
+                "scan_symbols: market_data ready shape=%s empty=%s",
+                market_data.shape if isinstance(market_data, pd.DataFrame) else None,
+                market_data.empty if isinstance(market_data, pd.DataFrame) else True,
+            )
         except Exception as exc:
-            logger.exception("Market data download failed")
+            logger.exception("scan_symbols: Market data download failed: %s", exc)
             return empty_futures_table(), [
-                f"Market data download failed: {exc}. Yahoo Finance may be rate-limited or unavailable."
+                f"Market data download failed: {exc}. Check Alpha Vantage / EODHD keys, quotas, and network."
             ]
+    else:
+        logger.info("scan_symbols: using synthetic sample history (no download_market_data)")
 
     for symbol in symbols:
         try:
@@ -2921,12 +3755,24 @@ def scan_symbols(
 
     if not rows:
         if no_data_symbols and not use_sample_data:
+            logger.warning(
+                "scan_symbols: no signal rows; no_data_symbols=%s errors=%s",
+                len(no_data_symbols),
+                len(errors),
+            )
             return empty_futures_table(), errors + [
-                f"No valid symbol data found: {len(no_data_symbols)} symbols returned no candles from Yahoo/Alpha/EODHD. "
-                "Check network/proxy/API keys, or enable 'Use sample data'."
+                f"No valid symbol data found: {len(no_data_symbols)} symbols returned no candles from Alpha Vantage / EODHD. "
+                "Check network/API keys and quotas, or enable 'Use sample data'."
             ]
+        logger.warning("scan_symbols: no signal rows; errors=%s", len(errors))
         return empty_futures_table(), errors or ["No valid symbol data found"]
 
+    logger.info(
+        "scan_symbols: success signal_rows=%s errors=%s no_data_symbols=%s",
+        len(rows),
+        len(errors),
+        len(no_data_symbols),
+    )
     return sort_futures_table(pd.DataFrame(rows)), errors
 
 
@@ -3616,7 +4462,7 @@ def render_sidebar(fno_symbols: list[str], option_symbols: list[str]) -> tuple[l
         use_sample_data = st.checkbox(
             "Use sample data",
             value=False,
-            help="Use this only to test the dashboard when Yahoo Finance is blocked or rate-limited.",
+            help="Use this only to test the dashboard when live market APIs are unavailable or rate-limited.",
         )
         period = "30d"
         interval = "1h"
@@ -3829,6 +4675,10 @@ def render_trend_watch_sections(signals: pd.DataFrame) -> None:
 
 def main() -> None:
     configure_runtime_environment()
+    logger.info(
+        "App session: main() started log_file=%s (set TRADING_DASHBOARD_CONSOLE_LOG=1 for stderr mirror)",
+        LOG_PATH,
+    )
     st.set_page_config(page_title="Futures Trading Dashboard", layout="wide", initial_sidebar_state="collapsed")
     inject_css()
 
@@ -3863,7 +4713,8 @@ def main() -> None:
             market_refresh_nonce=int(st.session_state.get(MARKET_SCAN_NONCE_KEY, 0)),
         )
 
-    render_market_data_cache_status_bar()
+    _ensure_market_cache_after_scan(symbols, period, interval, use_sample_data)
+    render_market_data_cache_status_bar(symbols, period, interval, use_sample_data)
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
