@@ -23,22 +23,47 @@ The dashboard is designed around these workflows:
 
 ### `app.py`
 
-This is the main Streamlit app. It contains:
+Thin Streamlit orchestration entrypoint. It wires modules together, runs the scan flow, applies display-only overlays, and renders the main dashboard and F&O tab.
 
-- Runtime setup and logging.
-- Strategy configuration.
-- Symbol loading and cleaning.
-- Market-data provider integration.
-- Cache and API quota handling.
-- Indicator calculations.
-- Market-regime detection.
-- Signal classification.
-- SQLite database setup and persistence helpers.
-- Trade history, active trade, selected trade, and selected F&O logic.
-- Options approximation.
-- F&O analysis logic.
-- Streamlit UI rendering.
-- Main app orchestration.
+### `dashboard_core.py`
+
+Behavior-compatible implementation core preserved during the refactor. The new modules expose clearer ownership boundaries while delegating to this stable core so trading behavior does not drift.
+
+### `config.py`
+
+Exports shared constants, `StrategyConfig`, `RiskSettings`, runtime setup, logging, and empty table factories.
+
+### `data_sources.py`
+
+Exports symbol loading, lot-size loading, Yahoo/Alpha/EODHD market-data helpers, NSE insider context helpers, and OHLCV normalization helpers.
+
+### `cache_layer.py`
+
+Exports market cache, disk cache metadata, API usage counters, quota tracking, and cache/status UI helpers.
+
+### `indicators.py`
+
+Exports RSI, ATR, ADX, and indicator enrichment helpers.
+
+### `strategy.py`
+
+Exports setup classification, signal labels, confidence scoring, trade plan creation, ranking, options approximation, market regime, and the display-only position-sizing overlay.
+
+### `trend_watch.py`
+
+Exports emerging, confirming, and strong trend-watch logic.
+
+### `db.py`
+
+Exports SQLite schema setup, active/closed trades, selected trades, selected F&O stocks, exits, and performance metric persistence.
+
+### `derivatives.py`
+
+Exports F&O analysis, expiry-aware recommendation helpers, theta risk, instrument recommendations, and 15m F&O entry confirmation helpers.
+
+### `ui_components.py`
+
+Exports reusable Streamlit UI helpers, table renderers, action buttons, popovers, formatting helpers, and tab section renderers.
 
 ### `settings.py`
 
@@ -133,6 +158,15 @@ The default scan configuration is:
 | `swing_lookback` | 2 | Swing high/low detection lookback |
 
 `minimum_rows` requires enough candles for EMA, ATR, volume average, and breakout window.
+
+`RiskSettings` controls display-only position sizing:
+
+| Field | Default | Meaning |
+| --- | ---: | --- |
+| `trading_capital` | 100000 | Capital used for sizing calculations |
+| `max_risk_per_trade_pct` | 1.0 | Max risk per signal as percent of capital |
+| `max_active_trades` | 5 | Sidebar planning input for active-trade capacity |
+| `max_total_portfolio_risk_pct` | 5.0 | Sidebar planning input for portfolio risk |
 
 ## 5. Market Data Knowledge
 
@@ -296,6 +330,10 @@ Controls:
 - EMA distance percent slider.
 - ATR multiplier slider.
 - Target RR slider.
+- Trading capital input.
+- Max risk per trade % input.
+- Max active trades input.
+- Max total portfolio risk % input.
 - Refresh button.
 
 The sidebar returns:
@@ -305,6 +343,7 @@ The sidebar returns:
 - Period.
 - Interval.
 - Sample-data mode.
+- Risk settings.
 
 ### Main Dashboard UI Order
 
@@ -337,6 +376,10 @@ The F&O tab renders:
 - Remove button.
 - Recommended instrument.
 - Theta risk.
+- Recommended expiry bucket.
+- Expiry risk.
+- 15m entry timing status.
+- 15m confirmation indicators.
 - Risk warnings.
 
 If no F&O stocks are selected, it tells the user to select stocks using the F&O button.
@@ -390,6 +433,11 @@ Columns:
 - RSI
 - Confidence Score
 - Trade Quality
+- Risk ₹
+- Suggested Qty
+- Suggested Lots
+- Reward ₹
+- Position Risk %
 - Select
 - Why
 - F&O
@@ -403,6 +451,28 @@ Shows short trade candidates:
 - `WEAK_SHORT`
 
 Same columns as long trades.
+
+### Position Sizing Columns
+
+Position sizing is a display-only risk overlay. It does not change signal generation, selected trades, the DB schema, or order placement.
+
+For each row:
+
+- `risk_per_share = abs(entry - stop_loss)`
+- `allowed_risk_amount = capital * risk_percent / 100`
+- `suggested_quantity = floor(allowed_risk_amount / risk_per_share)`
+- `estimated_loss_at_sl = suggested_quantity * risk_per_share`
+- `estimated_profit_at_target = suggested_quantity * abs(target - entry)`
+- `position_risk_pct = estimated_loss_at_sl / capital * 100`
+
+Futures lot handling:
+
+- If `data/fno_list.csv` contains a lot-size column such as `lot_size`, `lotsize`, `lot size`, `lot`, or `market_lot`, the app calculates `suggested_lots = floor(suggested_quantity / lot_size)`.
+- If lot size is missing, the table shows quantity only and leaves lots blank.
+
+Invalid risk:
+
+- If entry or stop loss is missing, or `risk_per_share <= 0`, the sizing columns show `Invalid risk`.
 
 ### Action Columns
 
@@ -436,6 +506,8 @@ Important UX rules in the current implementation:
 - Main F&O watch always uses latest scan values if the selected stock exists in the current scan.
 - F&O analysis supports multiple selected stocks.
 - Static F&O educational text was removed from the bottom of the F&O tab so selected analyses remain the focus.
+- Position sizing is shown as an aid only and never auto-places trades.
+- 15m entry confirmation appears only inside the F&O tab and never changes main dashboard signals.
 
 ## 11. Selection Logic
 
@@ -499,6 +571,37 @@ Monthly expiry window:
 - Expiry window is 0 to 3 days before expiry.
 - New auto-inserts are skipped during this window.
 - Weak active trades may be closed for expiry risk.
+
+## 12A. Position Sizing Knowledge
+
+Position sizing is applied after the 1h signal scan and before display tables are rendered. It is not part of the signal engine.
+
+Inputs come from the sidebar:
+
+- Trading capital.
+- Max risk per trade %.
+- Max active trades.
+- Max total portfolio risk %.
+
+Current sizing formula uses the explicit per-trade risk rule:
+
+```text
+risk_per_share = abs(entry - stop_loss)
+allowed_risk_amount = capital * risk_percent / 100
+suggested_quantity = floor(allowed_risk_amount / risk_per_share)
+estimated_loss_at_sl = suggested_quantity * risk_per_share
+estimated_profit_at_target = suggested_quantity * abs(target - entry)
+position_risk_pct = estimated_loss_at_sl / capital * 100
+```
+
+The max active trades and max portfolio risk inputs are captured for risk planning, while the row-level sizing formula follows max risk per trade exactly.
+
+This layer:
+
+- Does not alter signal labels.
+- Does not alter entries, stop losses, or targets.
+- Does not insert anything into the DB.
+- Does not place orders.
 
 ## 13. Trading Signal Knowledge
 
@@ -1009,6 +1112,81 @@ SIDEWAYS:
 - Alternate: wait for directional setup.
 - Avoid: ATM option buying.
 
+### Expiry-Aware F&O Recommendation
+
+The F&O tab adjusts derivative recommendations using monthly expiry awareness. This is separate from the core signal engine.
+
+Inputs:
+
+- Selected stock signal.
+- Move speed.
+- Expected hold bucket.
+- Current date.
+- Monthly expiry date.
+
+Rules:
+
+- Intraday or 1-2 days:
+  - ATM / slight ITM option is allowed.
+  - Nearest expiry is acceptable when more than 3 trading days remain.
+- 3-5 days:
+  - Prefer next monthly expiry.
+  - Avoid weekly or near-expiry option buying.
+  - Prefer ITM option or futures.
+- 1+ week:
+  - Prefer futures.
+  - Or next monthly deep ITM option.
+  - Avoid ATM options.
+- Within 3 trading days of monthly expiry:
+  - Do not recommend new option buying.
+  - Recommend futures or wait.
+
+The F&O tab displays:
+
+- Recommended expiry bucket.
+- Expiry risk.
+- Instrument recommendation.
+- Warning text.
+- Monthly expiry date.
+- Trading days left.
+
+### 15m F&O Entry Confirmation
+
+The main dashboard remains on 1h swing logic. The F&O tab adds a separate 15m confirmation only for selected F&O stocks.
+
+For selected F&O symbols only:
+
+1. Fetch 15m data.
+2. Calculate EMA20, EMA50, RSI, and ATR.
+3. Detect simple bullish/bearish reversal candles.
+4. Display entry timing status.
+
+Long confirmation requires:
+
+- Price above EMA20.
+- RSI > 50.
+- No bearish reversal candle.
+
+Short confirmation requires:
+
+- Price below EMA20.
+- RSI < 50.
+- No bullish reversal candle.
+
+Entry timing statuses:
+
+- `READY`: 15m direction confirmation is active and price is not too extended from EMA20.
+- `WAIT_FOR_PULLBACK`: direction is plausible but 15m confirmation is not ready.
+- `LATE_ENTRY`: confirmation is active but price is extended from EMA20.
+- `AVOID`: reversal candle, trend weakness, unavailable data, or invalid direction.
+
+This layer:
+
+- Does not affect main dashboard signals.
+- Does not affect selected trades.
+- Does not affect DB schema.
+- Displays only inside the F&O analysis tab.
+
 ### F&O Warnings
 
 Warnings are shown when:
@@ -1017,6 +1195,7 @@ Warnings are shown when:
 - ATR expansion > 0.018.
 - Volume strength >= 1.8.
 - Move is sideways.
+- Expiry risk indicates option buying should be avoided.
 
 ## 24. NSE Insider Context
 
@@ -1103,7 +1282,8 @@ python3 -m py_compile app.py
 
 Key implementation notes:
 
-- The project is currently mostly a single-file Streamlit app.
+- The project now uses a modular facade structure with `app.py` as the orchestration entrypoint.
+- `dashboard_core.py` preserves the behavior-compatible core during the refactor.
 - UI state that must survive refresh is stored in SQLite, not only `st.session_state`.
 - `st.cache_data` is used for stock lists and scan results.
 - Market fetch cache is both in-session and on disk.
@@ -1118,23 +1298,23 @@ Key implementation notes:
 - NSE insider context is supplemental and not used in scoring.
 - The app does not place trades.
 - Expiry logic is simplified to monthly expiry.
-- Most logic currently lives in `app.py`, so future maintainability would benefit from splitting into modules.
+- 15m confirmation depends on selected-symbol data availability.
+- `dashboard_core.py` still contains the preserved implementation while modules expose cleaner boundaries.
 
-## 29. Suggested Future Module Split
+## 29. Current Module Split
 
-A clean future refactor could split `app.py` into:
+The current refactor split is:
 
-- `config.py`: constants and `StrategyConfig`.
-- `data_sources.py`: Yahoo, Alpha, EODHD, NSE helpers.
-- `cache.py`: market-data and API quota persistence.
+- `app.py`: orchestration and Streamlit layout.
+- `dashboard_core.py`: behavior-compatible implementation core.
+- `config.py`: constants, `StrategyConfig`, `RiskSettings`.
+- `data_sources.py`: Yahoo, Alpha, EODHD, NSE helpers, symbol and lot-size loading.
+- `cache_layer.py`: market-data and API quota persistence.
 - `indicators.py`: RSI, ATR, ADX, EMA enrichment.
-- `strategy.py`: setup classification, signals, scoring.
+- `strategy.py`: setup classification, signals, scoring, position sizing.
 - `trend_watch.py`: emerging/confirming/strong logic.
 - `db.py`: SQLite schema and persistence helpers.
-- `options.py`: approximate options plan.
-- `derivatives.py`: F&O analysis.
-- `ui_sidebar.py`: sidebar controls.
-- `ui_tables.py`: table renderers and action controls.
-- `ui_pages.py`: main dashboard and F&O tab rendering.
+- `derivatives.py`: F&O analysis, expiry logic, 15m confirmation.
+- `ui_components.py`: sidebar controls, table renderers, action controls, dashboard sections.
 
-This would make each knowledge area easier to test and evolve independently.
+Future work can gradually move implementation bodies out of `dashboard_core.py` into these modules once behavior is fully locked down with tests.
