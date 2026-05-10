@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import os
+import secrets
 import sqlite3
 from datetime import datetime
+import time
+from pathlib import Path
 
 import streamlit as st
 
@@ -39,6 +43,127 @@ from ui_components import (
 )
 
 
+AUTH_DB_PATH = Path("/Users/abhishektripathi/Documents/New project/signals.db")
+
+
+def _ensure_auth_table() -> None:
+    with sqlite3.connect(AUTH_DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_auth_sessions (
+                token TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_expiry ON app_auth_sessions(expires_at)")
+        conn.commit()
+
+
+def _save_auth_session(token: str, created_at: int, expires_at: int) -> None:
+    with sqlite3.connect(AUTH_DB_PATH) as conn:
+        conn.execute("DELETE FROM app_auth_sessions WHERE expires_at <= ?", (created_at,))
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO app_auth_sessions(token, created_at, expires_at)
+            VALUES(?, ?, ?)
+            """,
+            (token, int(created_at), int(expires_at)),
+        )
+        conn.commit()
+
+
+def _is_auth_token_valid(token: str, now_ts: int) -> bool:
+    if not token:
+        return False
+    with sqlite3.connect(AUTH_DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT expires_at FROM app_auth_sessions WHERE token = ?",
+            (str(token),),
+        ).fetchone()
+    if row is None:
+        return False
+    return int(row[0]) > int(now_ts)
+
+
+def _delete_auth_session(token: str) -> None:
+    if not token:
+        return
+    with sqlite3.connect(AUTH_DB_PATH) as conn:
+        conn.execute("DELETE FROM app_auth_sessions WHERE token = ?", (str(token),))
+        conn.commit()
+
+
+def _get_secret_or_env(name: str) -> str:
+    env_val = os.getenv(name)
+    if isinstance(env_val, str) and env_val.strip():
+        return env_val.strip()
+    try:
+        sec_val = st.secrets.get(name)  # type: ignore[attr-defined]
+        if isinstance(sec_val, str) and sec_val.strip():
+            return sec_val.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _render_login_gate() -> bool:
+    _ensure_auth_table()
+    now_ts = int(time.time())
+    max_session_seconds = 60 * 60
+    token_from_url = str(st.query_params.get("auth_token", "") or "")
+    if token_from_url and _is_auth_token_valid(token_from_url, now_ts):
+        st.session_state["is_authenticated"] = True
+        st.session_state["auth_login_ts"] = now_ts
+        st.session_state["auth_token"] = token_from_url
+        st.session_state.pop("auth_error", None)
+        return True
+
+    if st.session_state.get("is_authenticated", False):
+        auth_ts = int(st.session_state.get("auth_login_ts", 0) or 0)
+        if auth_ts > 0 and (now_ts - auth_ts) < max_session_seconds:
+            return True
+        st.session_state["is_authenticated"] = False
+        st.session_state.pop("auth_login_ts", None)
+        old_token = str(st.session_state.get("auth_token", "") or token_from_url)
+        _delete_auth_session(old_token)
+        st.session_state.pop("auth_token", None)
+        if "auth_token" in st.query_params:
+            del st.query_params["auth_token"]
+        st.session_state["auth_error"] = "Session expired. Please login again."
+
+    expected_user = _get_secret_or_env("APP_USERNAME")
+    expected_pass = _get_secret_or_env("APP_PASSWORD")
+
+    st.title("Login")
+    st.caption("Please sign in to access the trading dashboard.")
+    with st.form("login_form", clear_on_submit=False):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login", use_container_width=True)
+        if submitted:
+            if (
+                expected_user
+                and expected_pass
+                and username == expected_user
+                and password == expected_pass
+            ):
+                auth_token = secrets.token_urlsafe(32)
+                st.session_state["is_authenticated"] = True
+                st.session_state["auth_login_ts"] = now_ts
+                st.session_state["auth_token"] = auth_token
+                _save_auth_session(auth_token, now_ts, now_ts + max_session_seconds)
+                st.query_params["auth_token"] = auth_token
+                st.session_state.pop("auth_error", None)
+                st.rerun()
+            else:
+                st.session_state["auth_error"] = "Invalid credentials."
+    if st.session_state.get("auth_error"):
+        st.error(str(st.session_state["auth_error"]))
+    return False
+
+
 def main() -> None:
     configure_runtime_environment()
     logger.info(
@@ -47,6 +172,20 @@ def main() -> None:
     )
     st.set_page_config(page_title="Futures Trading Dashboard", layout="wide", initial_sidebar_state="collapsed")
     inject_css()
+
+    if not _render_login_gate():
+        return
+
+    with st.sidebar:
+        if st.button("Logout", use_container_width=True):
+            auth_token = str(st.session_state.get("auth_token", "") or st.query_params.get("auth_token", "") or "")
+            _delete_auth_session(auth_token)
+            st.session_state["is_authenticated"] = False
+            st.session_state.pop("auth_login_ts", None)
+            st.session_state.pop("auth_token", None)
+            if "auth_token" in st.query_params:
+                del st.query_params["auth_token"]
+            st.rerun()
 
     fno_symbols, fno_error = load_stock_list()
     option_symbols, options_error = load_option_list()
@@ -124,7 +263,7 @@ def main() -> None:
     main_tab, derivative_tab = st.tabs(["📊 Main Dashboard", "📈 Futures & Options Analysis"])
 
     with main_tab:
-        render_selected_trades_focus(signals)
+        render_selected_trades_focus(signals, regime)
         render_selected_fno_main(signals)
         render_top_trade_highlight(signals)
         render_market_regime(regime, signals, last_updated)
@@ -148,7 +287,7 @@ def main() -> None:
         render_runtime_log_tail(100)
 
     with derivative_tab:
-        render_derivative_analysis_tab(signals)
+        render_derivative_analysis_tab(signals, regime)
 
 
 if __name__ == "__main__":

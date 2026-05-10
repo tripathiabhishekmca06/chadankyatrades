@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.cookiejar
 import html
+import hashlib
 import json
 import logging
 import os
@@ -115,6 +116,14 @@ HISTORY_COLUMNS = [
     "exit_reason",
     "exit_price",
     "pnl_percent",
+    "original_entry_price",
+    "original_stop_loss",
+    "original_target",
+    "original_signal_type",
+    "original_selected_timestamp",
+    "final_exit_price",
+    "final_exit_reason",
+    "final_pnl_percent",
 ]
 
 ACTIVE_COLUMNS = [
@@ -159,6 +168,10 @@ SIGNAL_PRIORITY = {
 
 ALPHA_API_KEY = get_alpha_vantage_api_key()
 EODHD_API_KEY = get_eodhd_api_key()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini").strip()
 
 ALPHA_API_MINUTE_LIMIT = 5
 ALPHA_API_DAY_LIMIT = 500
@@ -2930,8 +2943,33 @@ def init_db(connection: sqlite3.Connection) -> None:
         row["name"]
         for row in connection.execute("PRAGMA table_info(signals)").fetchall()
     }
-    if "pnl_percent" not in existing_columns:
-        connection.execute("ALTER TABLE signals ADD COLUMN pnl_percent REAL")
+    signal_migrations = {
+        "pnl_percent": "REAL",
+        "original_entry_price": "REAL",
+        "original_stop_loss": "REAL",
+        "original_target": "REAL",
+        "original_signal_type": "TEXT",
+        "original_selected_timestamp": "TEXT",
+        "final_exit_price": "REAL",
+        "final_exit_reason": "TEXT",
+        "final_pnl_percent": "REAL",
+    }
+    for column, column_type in signal_migrations.items():
+        if column not in existing_columns:
+            connection.execute(f"ALTER TABLE signals ADD COLUMN {column} {column_type}")
+    connection.execute(
+        """
+        UPDATE signals
+        SET original_entry_price = COALESCE(original_entry_price, entry_price),
+            original_stop_loss = COALESCE(original_stop_loss, stop_loss),
+            original_target = COALESCE(original_target, target),
+            original_signal_type = COALESCE(original_signal_type, signal_type),
+            original_selected_timestamp = COALESCE(original_selected_timestamp, timestamp),
+            final_exit_price = COALESCE(final_exit_price, exit_price),
+            final_exit_reason = COALESCE(final_exit_reason, exit_reason),
+            final_pnl_percent = COALESCE(final_pnl_percent, pnl_percent)
+        """
+    )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_signals_stock ON signals(stock)"
     )
@@ -2971,6 +3009,35 @@ def init_db(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    selected_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(selected_trades)").fetchall()
+    }
+    selected_migrations = {
+        "original_entry_price": "REAL",
+        "original_stop_loss": "REAL",
+        "original_target": "REAL",
+        "original_signal_type": "TEXT",
+        "original_selected_timestamp": "TEXT",
+        "final_exit_price": "REAL",
+        "final_exit_reason": "TEXT",
+        "final_pnl_percent": "REAL",
+        "ai_auto_insight_done": "INTEGER DEFAULT 0",
+    }
+    for column, column_type in selected_migrations.items():
+        if column not in selected_columns:
+            connection.execute(f"ALTER TABLE selected_trades ADD COLUMN {column} {column_type}")
+    connection.execute(
+        """
+        UPDATE selected_trades
+        SET original_entry_price = COALESCE(original_entry_price, entry_price),
+            original_stop_loss = COALESCE(original_stop_loss, stop_loss),
+            original_target = COALESCE(original_target, target),
+            original_signal_type = COALESCE(original_signal_type, signal_type),
+            original_selected_timestamp = COALESCE(original_selected_timestamp, selected_timestamp),
+            ai_auto_insight_done = COALESCE(ai_auto_insight_done, 0)
+        """
+    )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_selected_status ON selected_trades(status)"
     )
@@ -2985,6 +3052,25 @@ def init_db(connection: sqlite3.Connection) -> None:
     )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_selected_fno_ts ON selected_fno_stocks(selected_timestamp)"
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ai_trade_insights (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            signal_type TEXT,
+            payload_hash TEXT NOT NULL,
+            generated_timestamp TEXT NOT NULL,
+            insight_text TEXT NOT NULL,
+            provider_name TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_insight_symbol_ts ON ai_trade_insights(symbol, generated_timestamp DESC)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_insight_payload ON ai_trade_insights(payload_hash, provider_name)"
     )
     connection.commit()
 
@@ -3009,9 +3095,11 @@ def insert_signal(connection: sqlite3.Connection, data: dict[str, Any]) -> None:
             """
             INSERT INTO signals (
                 timestamp, stock, signal_type, entry_price, stop_loss, target,
-                confidence_score, status, exit_reason, exit_price
+                confidence_score, status, exit_reason, exit_price,
+                original_entry_price, original_stop_loss, original_target,
+                original_signal_type, original_selected_timestamp
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', '', NULL)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', '', NULL, ?, ?, ?, ?, ?)
             """,
             (
                 data["timestamp"],
@@ -3021,6 +3109,11 @@ def insert_signal(connection: sqlite3.Connection, data: dict[str, Any]) -> None:
                 data["stop_loss"],
                 data["target"],
                 data["confidence_score"],
+                data["entry_price"],
+                data["stop_loss"],
+                data["target"],
+                data["signal_type"],
+                data["timestamp"],
             ),
         )
     except sqlite3.OperationalError as exc:
@@ -3030,8 +3123,7 @@ def insert_signal(connection: sqlite3.Connection, data: dict[str, Any]) -> None:
 def get_active_trades(connection: sqlite3.Connection) -> pd.DataFrame:
     rows = connection.execute(
         """
-        SELECT id, timestamp, stock, signal_type, entry_price, stop_loss, target,
-               confidence_score, status, exit_reason, exit_price, pnl_percent
+        SELECT *
         FROM signals
         WHERE status = 'ACTIVE'
         ORDER BY timestamp DESC, id DESC
@@ -3044,7 +3136,7 @@ def close_trade(connection: sqlite3.Connection, stock: str, exit_price: float, r
     try:
         active_trade = connection.execute(
             """
-            SELECT id, signal_type, entry_price
+            SELECT id, signal_type, entry_price, original_signal_type, original_entry_price
             FROM signals
             WHERE stock = ? AND status = 'ACTIVE'
             ORDER BY id DESC
@@ -3055,8 +3147,8 @@ def close_trade(connection: sqlite3.Connection, stock: str, exit_price: float, r
         if active_trade is None:
             return
 
-        direction = signal_direction(str(active_trade["signal_type"]))
-        entry_price = float(active_trade["entry_price"])
+        direction = signal_direction(str(active_trade["original_signal_type"] or active_trade["signal_type"]))
+        entry_price = _first_numeric(active_trade["original_entry_price"], active_trade["entry_price"])
         pnl_percent = pnl_pct(direction, entry_price, float(exit_price))
 
         connection.execute(
@@ -3066,10 +3158,16 @@ def close_trade(connection: sqlite3.Connection, stock: str, exit_price: float, r
                 exit_price = ?,
                 pnl_percent = ?,
                 exit_reason = ?,
+                final_exit_price = ?,
+                final_pnl_percent = ?,
+                final_exit_reason = ?,
                 timestamp = ?
             WHERE id = ?
             """,
             (
+                exit_price,
+                pnl_percent,
+                reason,
                 exit_price,
                 pnl_percent,
                 reason,
@@ -3080,10 +3178,13 @@ def close_trade(connection: sqlite3.Connection, stock: str, exit_price: float, r
         connection.execute(
             """
             UPDATE selected_trades
-            SET status = 'CLOSED'
+            SET status = 'CLOSED',
+                final_exit_price = ?,
+                final_pnl_percent = ?,
+                final_exit_reason = ?
             WHERE stock = ? AND status = 'ACTIVE'
             """,
-            (str(stock).upper(),),
+            (exit_price, pnl_percent, reason, str(stock).upper()),
         )
     except sqlite3.OperationalError as exc:
         logger.exception("Failed to close trade for %s: %s", stock, exc)
@@ -3092,7 +3193,7 @@ def close_trade(connection: sqlite3.Connection, stock: str, exit_price: float, r
 def get_active_selected_trades(connection: sqlite3.Connection) -> list[sqlite3.Row]:
     return connection.execute(
         """
-        SELECT stock, signal_type, entry_price, stop_loss, target, selected_timestamp, status
+        SELECT *
         FROM selected_trades
         WHERE status = 'ACTIVE'
         ORDER BY selected_timestamp DESC
@@ -3113,15 +3214,18 @@ def insert_selected_trade_from_row(connection: sqlite3.Connection, row: pd.Serie
     if any(np.isnan(v) for v in (entry, sl, tgt)):
         return False
     sig_type = str(row.get("Signal Type", "") or "")
+    original_signal_type = signal or sig_type
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cur = connection.execute(
         """
         INSERT OR IGNORE INTO selected_trades (
-            stock, signal_type, entry_price, stop_loss, target, selected_timestamp, status
+            stock, signal_type, entry_price, stop_loss, target, selected_timestamp, status,
+            original_entry_price, original_stop_loss, original_target,
+            original_signal_type, original_selected_timestamp
         )
-        VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE')
+        VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?)
         """,
-        (stock, sig_type, entry, sl, tgt, ts),
+        (stock, sig_type, entry, sl, tgt, ts, entry, sl, tgt, original_signal_type, ts),
     )
     return (cur.rowcount or 0) > 0
 
@@ -3130,10 +3234,43 @@ def delete_selected_trade(connection: sqlite3.Connection, stock: str) -> None:
     connection.execute("DELETE FROM selected_trades WHERE stock = ?", (str(stock).upper(),))
 
 
-def mark_selected_trade_closed_manual(connection: sqlite3.Connection, stock: str) -> None:
-    connection.execute(
-        "UPDATE selected_trades SET status = 'CLOSED' WHERE stock = ?",
+def mark_selected_trade_closed_manual(
+    connection: sqlite3.Connection,
+    stock: str,
+    exit_price: float | None = None,
+    reason: str = "Manual Close",
+) -> None:
+    trade = connection.execute(
+        """
+        SELECT original_signal_type, signal_type, original_entry_price, entry_price
+        FROM selected_trades
+        WHERE stock = ? AND status = 'ACTIVE'
+        LIMIT 1
+        """,
         (str(stock).upper(),),
+    ).fetchone()
+    final_exit = pd.to_numeric(exit_price, errors="coerce") if exit_price is not None else np.nan
+    final_pnl = np.nan
+    if trade is not None and pd.notna(final_exit):
+        entry = _first_numeric(trade["original_entry_price"], trade["entry_price"])
+        direction = signal_direction(str(trade["original_signal_type"] or trade["signal_type"]))
+        if pd.notna(entry):
+            final_pnl = pnl_pct(direction, entry, float(final_exit))
+    connection.execute(
+        """
+        UPDATE selected_trades
+        SET status = 'CLOSED',
+            final_exit_price = ?,
+            final_exit_reason = ?,
+            final_pnl_percent = ?
+        WHERE stock = ?
+        """,
+        (
+            float(final_exit) if pd.notna(final_exit) else None,
+            reason,
+            float(final_pnl) if pd.notna(final_pnl) else None,
+            str(stock).upper(),
+        ),
     )
 
 
@@ -3210,11 +3347,94 @@ def sl_target_distance_pct_of_entry(
     return np.nan, np.nan
 
 
+def _pct_change_text(original: float, live: float, label: str) -> str:
+    if original == 0 or np.isnan(original) or np.isnan(live):
+        return f"{label} change unavailable"
+    pct = (live - original) / abs(original) * 100.0
+    moved = "up" if pct > 0 else "down" if pct < 0 else "unchanged"
+    return f"{label} {moved} by {abs(pct):.2f}%"
+
+
+def _first_numeric(*values: Any, default: float = np.nan) -> float:
+    for value in values:
+        numeric = pd.to_numeric(value, errors="coerce")
+        if pd.notna(numeric):
+            return float(numeric)
+    return float(default)
+
+
+def _selected_trade_live_plan(sel: sqlite3.Row, live: pd.Series | None) -> dict[str, Any]:
+    original_signal = str(sel["original_signal_type"] or sel["signal_type"] or "")
+    original_direction = signal_direction(original_signal)
+    if original_direction == "WAIT":
+        original_direction = direction_from_stored_signal_type(original_signal)
+    if live is None:
+        return {
+            "status": "SIGNAL_NOT_FOUND",
+            "entry": np.nan,
+            "stop_loss": np.nan,
+            "target": np.nan,
+            "signal": "",
+            "changes": ["No latest signal available"],
+        }
+
+    live_signal = str(live.get("Signal", ""))
+    live_direction = signal_direction(live_signal)
+    if live_signal == "WAIT" or live_direction == "WAIT" or live_direction != original_direction:
+        status = "INVALIDATED"
+    else:
+        live_strength = signal_strength(live_signal)
+        original_strength = signal_strength(original_signal)
+        if live_strength == "WEAK" and original_strength in {"STRONG", "EARLY"}:
+            status = "WEAKENED"
+        else:
+            original_entry = _first_numeric(sel["original_entry_price"], sel["entry_price"])
+            original_sl = _first_numeric(sel["original_stop_loss"], sel["stop_loss"])
+            original_target = _first_numeric(sel["original_target"], sel["target"])
+            live_entry = float(live.get("Entry", np.nan))
+            live_sl = float(live.get("Stop Loss", np.nan))
+            live_target = float(live.get("Target", np.nan))
+            changed = any(
+                pd.notna(v)
+                and abs(float(o) - float(v)) > max(abs(float(o)) * 0.001, 0.01)
+                for o, v in (
+                    (original_entry, live_entry),
+                    (original_sl, live_sl),
+                    (original_target, live_target),
+                )
+            )
+            status = "UPDATED" if changed else "STILL_VALID"
+
+    original_entry = _first_numeric(sel["original_entry_price"], sel["entry_price"])
+    original_sl = _first_numeric(sel["original_stop_loss"], sel["stop_loss"])
+    original_target = _first_numeric(sel["original_target"], sel["target"])
+    live_entry = float(live.get("Entry", np.nan))
+    live_sl = float(live.get("Stop Loss", np.nan))
+    live_target = float(live.get("Target", np.nan))
+    if original_direction == "LONG":
+        sl_descriptor = "SL tightened" if live_sl > original_sl else "SL loosened" if live_sl < original_sl else "SL unchanged"
+    elif original_direction == "SHORT":
+        sl_descriptor = "SL tightened" if live_sl < original_sl else "SL loosened" if live_sl > original_sl else "SL unchanged"
+    else:
+        sl_descriptor = "SL change unavailable"
+    return {
+        "status": status,
+        "entry": live_entry,
+        "stop_loss": live_sl,
+        "target": live_target,
+        "signal": live_signal,
+        "changes": [
+            _pct_change_text(original_entry, live_entry, "Entry"),
+            f"{sl_descriptor} ({_pct_change_text(original_sl, live_sl, 'SL')})",
+            _pct_change_text(original_target, live_target, "Target"),
+        ],
+    }
+
+
 def get_trade_history(connection: sqlite3.Connection, limit: int = 20) -> pd.DataFrame:
     rows = connection.execute(
         """
-        SELECT id, timestamp, stock, signal_type, entry_price, stop_loss, target,
-               confidence_score, status, exit_reason, exit_price, pnl_percent
+        SELECT *
         FROM signals
         WHERE status = 'CLOSED'
         ORDER BY timestamp DESC, id DESC
@@ -3379,15 +3599,16 @@ def process_exits(connection: sqlite3.Connection, signals: pd.DataFrame) -> None
         latest = latest_by_stock.loc[stock]
         current_signal = str(latest["Signal"])
         current_price = float(latest.get("Current Price", latest.get("Entry", np.nan)))
-        entry_signal = str(trade["signal_type"])
+        entry_signal = str(trade.get("original_signal_type", "") or trade["signal_type"])
         direction = signal_direction(entry_signal)
         current_direction = signal_direction(current_signal)
-        stop_loss = float(trade["stop_loss"])
-        target = float(trade["target"])
+        stop_loss = _first_numeric(trade.get("original_stop_loss"), trade["stop_loss"])
+        target = _first_numeric(trade.get("original_target"), trade["target"])
         rsi = float(latest.get("RSI", np.nan))
         ema20 = float(latest.get("EMA20", np.nan))
         opened_at = pd.to_datetime(trade["timestamp"], errors="coerce")
-        live_pnl = pnl_pct(direction, float(trade["entry_price"]), current_price)
+        original_entry = _first_numeric(trade.get("original_entry_price"), trade["entry_price"])
+        live_pnl = pnl_pct(direction, original_entry, current_price)
 
         exit_reason = ""
         if direction == "LONG" and not np.isnan(stop_loss) and current_price <= stop_loss:
@@ -4213,8 +4434,8 @@ def active_trades_table(active: pd.DataFrame, signals: pd.DataFrame) -> pd.DataF
     rows = []
     for _, trade in active.iterrows():
         stock = str(trade["stock"]).upper()
-        direction = signal_direction(str(trade["signal_type"]))
-        entry_price = float(trade["entry_price"])
+        direction = signal_direction(str(trade.get("original_signal_type") or trade["signal_type"]))
+        entry_price = _first_numeric(trade.get("original_entry_price"), trade["entry_price"])
         current_price = float(current_prices.get(stock, entry_price))
         rows.append(
             {
@@ -4223,8 +4444,8 @@ def active_trades_table(active: pd.DataFrame, signals: pd.DataFrame) -> pd.DataF
                 "Entry": entry_price,
                 "Current Price": current_price,
                 "P&L %": pnl_pct(direction, entry_price, current_price),
-                "SL": float(trade["stop_loss"]),
-                "Target": float(trade["target"]),
+                "SL": _first_numeric(trade.get("original_stop_loss"), trade["stop_loss"]),
+                "Target": _first_numeric(trade.get("original_target"), trade["target"]),
                 "Confidence": int(trade["confidence_score"]) if not pd.isna(trade["confidence_score"]) else 0,
             }
         )
@@ -4241,10 +4462,10 @@ def closed_trades_table(closed: pd.DataFrame, limit: int = 20) -> pd.DataFrame:
 
     rows = []
     for _, trade in closed.iterrows():
-        direction = signal_direction(str(trade["signal_type"]))
-        entry_price = float(trade["entry_price"])
-        exit_price = float(trade["exit_price"])
-        stored_pnl = pd.to_numeric(trade.get("pnl_percent"), errors="coerce")
+        direction = signal_direction(str(trade.get("original_signal_type") or trade["signal_type"]))
+        entry_price = _first_numeric(trade.get("original_entry_price"), trade["entry_price"])
+        exit_price = _first_numeric(trade.get("final_exit_price"), trade["exit_price"])
+        stored_pnl = pd.to_numeric(trade.get("final_pnl_percent", trade.get("pnl_percent")), errors="coerce")
         final_pnl = float(stored_pnl) if not pd.isna(stored_pnl) else pnl_pct(direction, entry_price, exit_price)
         rows.append(
             {
@@ -4252,7 +4473,7 @@ def closed_trades_table(closed: pd.DataFrame, limit: int = 20) -> pd.DataFrame:
                 "Entry": entry_price,
                 "Exit": exit_price,
                 "P&L %": final_pnl,
-                "Exit Reason": trade["exit_reason"],
+                "Exit Reason": trade.get("final_exit_reason") or trade["exit_reason"],
             }
         )
 
@@ -4521,6 +4742,616 @@ def _failed_messages(raw: Any) -> list[str]:
     if isinstance(raw, str) and raw.strip():
         return [part.strip() for part in raw.split("||") if part.strip()]
     return []
+
+
+class AIInsightProvider:
+    provider_name = "base"
+
+    def generate_trade_insight(self, trade_payload: dict[str, Any]) -> str:
+        raise NotImplementedError
+
+
+def _env_or_secret(name: str, default: str = "") -> str:
+    env_val = os.getenv(name)
+    if isinstance(env_val, str) and env_val.strip():
+        return env_val.strip()
+    try:
+        secret_val = st.secrets.get(name)  # type: ignore[attr-defined]
+        if isinstance(secret_val, str) and secret_val.strip():
+            return secret_val.strip()
+    except Exception:
+        pass
+    return default
+
+
+class OpenAIInsightProvider(AIInsightProvider):
+    provider_name = "openai"
+
+    def __init__(self, api_key: str | None = None, model: str | None = None) -> None:
+        self.api_key = str(api_key or _env_or_secret("OPENAI_API_KEY", OPENAI_API_KEY)).strip()
+        self.model = str(model or _env_or_secret("OPENAI_MODEL", OPENAI_MODEL)).strip() or "gpt-5-mini"
+
+    def generate_trade_insight(self, trade_payload: dict[str, Any]) -> str:
+        if not self.api_key:
+            raise RuntimeError("OPENAI_API_KEY not configured.")
+        instructions = (
+            "You are an advisory trade analyst. You must never change signals, SL, target, confidence, or exits. "
+            "You are commentary only.\n\n"
+            "Generate exactly these sections:\n"
+            "1. Trade Thesis\n"
+            "2. Strengths\n"
+            "3. Risks\n"
+            "4. Market Context\n"
+            "5. Derivative Suitability\n"
+            "6. Risk Management Notes\n\n"
+            "Rules:\n"
+            "- No guaranteed profit language.\n"
+            "- No exact price prediction.\n"
+            "- No instructions to modify SL/target or signal."
+        )
+        url = "https://api.openai.com/v1/responses"
+        body = {
+            "model": self.model,
+            "input": [
+                {"role": "system", "content": [{"type": "input_text", "text": instructions}]},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": f"Payload:\n{json.dumps(trade_payload, sort_keys=True, ensure_ascii=True)}",
+                        }
+                    ],
+                },
+            ],
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            response = requests.post(url, headers=headers, json=body, timeout=25)
+            if not response.ok:
+                raise RuntimeError(f"OpenAI request failed with HTTP {response.status_code}.")
+            payload = response.json()
+            text = str(payload.get("output_text", "") or "").strip()
+            if not text:
+                raise RuntimeError("OpenAI returned empty text.")
+            return text
+        except Exception as exc:
+            raise RuntimeError(f"OpenAI exception: {exc}") from exc
+
+
+class GeminiInsightProvider(AIInsightProvider):
+    provider_name = "gemini"
+
+    def __init__(self, api_key: str | None = None, model: str | None = None) -> None:
+        self.api_key = str(api_key or _env_or_secret("GEMINI_API_KEY", GEMINI_API_KEY)).strip()
+        self.model = str(model or _env_or_secret("GEMINI_MODEL", GEMINI_MODEL)).strip() or "gemini-1.5-flash"
+
+    def generate_trade_insight(self, trade_payload: dict[str, Any]) -> str:
+        if not self.api_key:
+            raise RuntimeError("Gemini API key not configured.")
+        prompt = (
+            "You are an advisory trade analyst. You must never change signals, SL, target, confidence, or exits. "
+            "You are commentary only.\n\n"
+            "Use the provided JSON payload and generate exactly these sections:\n"
+            "1. Trade Thesis\n"
+            "2. Strengths\n"
+            "3. Risks\n"
+            "4. Market Context\n"
+            "5. Derivative Suitability\n"
+            "6. Risk Management Notes\n\n"
+            "Rules:\n"
+            "- No guaranteed profit language.\n"
+            "- No exact price prediction.\n"
+            "- No instructions to modify SL/target or signal.\n\n"
+            f"Payload:\n{json.dumps(trade_payload, sort_keys=True, ensure_ascii=True)}"
+        )
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+            f"?key={self.api_key}"
+        )
+        body = {"contents": [{"parts": [{"text": prompt}]}]}
+        try:
+            response = requests.post(url, json=body, timeout=25)
+            if not response.ok:
+                raise RuntimeError(f"Gemini request failed with HTTP {response.status_code}.")
+            payload = response.json()
+            candidates = payload.get("candidates") or []
+            if not candidates:
+                raise RuntimeError("Gemini returned no candidates.")
+            parts = (((candidates[0] or {}).get("content") or {}).get("parts") or [])
+            text = "\n".join(str(part.get("text", "")).strip() for part in parts if str(part.get("text", "")).strip())
+            if not text:
+                raise RuntimeError("Gemini returned empty text.")
+            return text
+        except Exception as exc:
+            raise RuntimeError(f"Gemini exception: {exc}") from exc
+
+
+def get_default_ai_insight_provider() -> AIInsightProvider:
+    return GeminiInsightProvider()
+
+
+class FinancialSentimentProvider:
+    provider_name = "financial_sentiment_base"
+
+    def generate_sentiment(self, sentiment_payload: dict[str, Any]) -> str:
+        raise NotImplementedError
+
+
+class GeminiSentimentProvider(FinancialSentimentProvider):
+    provider_name = "gemini_sentiment"
+
+    def __init__(self, api_key: str | None = None, model: str | None = None) -> None:
+        self.api_key = str(api_key or _env_or_secret("GEMINI_API_KEY", GEMINI_API_KEY)).strip()
+        self.model = str(model or _env_or_secret("GEMINI_MODEL", GEMINI_MODEL)).strip() or "gemini-1.5-flash"
+
+    def generate_sentiment(self, sentiment_payload: dict[str, Any]) -> str:
+        if not self.api_key:
+            raise RuntimeError("Gemini API key not configured.")
+        prompt = (
+            "You are an advisory-only market sentiment assistant.\n"
+            "Never change signals, stop-loss, target, confidence, or exits.\n"
+            "Return concise output in this exact structure:\n"
+            "Sentiment: bullish|neutral|bearish\n\n"
+            "AI Summary:\n"
+            "- trade thesis\n"
+            "- recent sentiment\n"
+            "- momentum context\n\n"
+            "Key Risks:\n"
+            "- ...\n\n"
+            "Top Headlines:\n"
+            "- optional, if unavailable say not available.\n\n"
+            "No guaranteed returns. No exact price prediction.\n\n"
+            f"Payload:\n{json.dumps(sentiment_payload, sort_keys=True, ensure_ascii=True)}"
+        )
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+            f"?key={self.api_key}"
+        )
+        body = {"contents": [{"parts": [{"text": prompt}]}]}
+        try:
+            response = requests.post(url, json=body, timeout=25)
+            if not response.ok:
+                raise RuntimeError(f"Gemini request failed with HTTP {response.status_code}.")
+            payload = response.json()
+            candidates = payload.get("candidates") or []
+            if not candidates:
+                raise RuntimeError("Gemini returned no candidates.")
+            parts = (((candidates[0] or {}).get("content") or {}).get("parts") or [])
+            text = "\n".join(str(part.get("text", "")).strip() for part in parts if str(part.get("text", "")).strip())
+            if not text:
+                raise RuntimeError("Gemini returned empty text.")
+            return text
+        except Exception as exc:
+            raise RuntimeError(f"Gemini exception: {exc}") from exc
+
+
+def get_default_financial_sentiment_provider() -> FinancialSentimentProvider:
+    return GeminiSentimentProvider()
+
+
+def _ai_payload_hash(payload: dict[str, Any]) -> str:
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    try:
+        ts = pd.to_datetime(value, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts.to_pydatetime()
+    except Exception:
+        return None
+
+
+def get_cached_ai_insight(
+    connection: sqlite3.Connection,
+    symbol: str,
+    signal_type: str,
+    payload_hash: str,
+    provider_name: str,
+    ttl_minutes: int = 30,
+) -> sqlite3.Row | None:
+    row = connection.execute(
+        """
+        SELECT *
+        FROM ai_trade_insights
+        WHERE symbol = ? AND signal_type = ? AND payload_hash = ? AND provider_name = ?
+        ORDER BY generated_timestamp DESC
+        LIMIT 1
+        """,
+        (str(symbol).upper(), str(signal_type), str(payload_hash), str(provider_name)),
+    ).fetchone()
+    if row is None:
+        return None
+    generated_at = _parse_timestamp(row["generated_timestamp"])
+    if generated_at is None:
+        return None
+    if datetime.now() - generated_at > timedelta(minutes=max(1, int(ttl_minutes))):
+        return None
+    return row
+
+
+def get_latest_ai_insight(
+    connection: sqlite3.Connection,
+    symbol: str,
+    provider_name: str,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT *
+        FROM ai_trade_insights
+        WHERE symbol = ? AND provider_name = ?
+        ORDER BY generated_timestamp DESC
+        LIMIT 1
+        """,
+        (str(symbol).upper(), str(provider_name)),
+    ).fetchone()
+
+
+def save_ai_insight(
+    connection: sqlite3.Connection,
+    symbol: str,
+    signal_type: str,
+    payload_hash: str,
+    provider_name: str,
+    insight_text: str,
+) -> sqlite3.Row:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    connection.execute(
+        """
+        INSERT INTO ai_trade_insights (
+            symbol, signal_type, payload_hash, generated_timestamp, insight_text, provider_name
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (str(symbol).upper(), str(signal_type), str(payload_hash), ts, str(insight_text), str(provider_name)),
+    )
+    return connection.execute(
+        """
+        SELECT *
+        FROM ai_trade_insights
+        WHERE symbol = ? AND signal_type = ? AND payload_hash = ? AND provider_name = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (str(symbol).upper(), str(signal_type), str(payload_hash), str(provider_name)),
+    ).fetchone()
+
+
+def generate_or_get_trade_ai_insight(
+    connection: sqlite3.Connection,
+    provider: AIInsightProvider,
+    trade_payload: dict[str, Any],
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    symbol = str(trade_payload.get("symbol", "")).upper()
+    signal_type = str(trade_payload.get("signal_type", "UNKNOWN"))
+    payload_hash = _ai_payload_hash(trade_payload)
+    provider_name = str(getattr(provider, "provider_name", "unknown"))
+    cached = None if force_refresh else get_cached_ai_insight(
+        connection,
+        symbol=symbol,
+        signal_type=signal_type,
+        payload_hash=payload_hash,
+        provider_name=provider_name,
+        ttl_minutes=30,
+    )
+    if cached is not None:
+        return {
+            "cached": True,
+            "insight_text": str(cached["insight_text"]),
+            "generated_timestamp": str(cached["generated_timestamp"]),
+            "provider_name": str(cached["provider_name"]),
+            "payload_hash": payload_hash,
+        }
+    insight_text = provider.generate_trade_insight(trade_payload)
+    saved = save_ai_insight(
+        connection,
+        symbol=symbol,
+        signal_type=signal_type,
+        payload_hash=payload_hash,
+        provider_name=provider_name,
+        insight_text=insight_text,
+    )
+    return {
+        "cached": False,
+        "insight_text": str(saved["insight_text"]),
+        "generated_timestamp": str(saved["generated_timestamp"]),
+        "provider_name": str(saved["provider_name"]),
+        "payload_hash": payload_hash,
+    }
+
+
+def _insider_summary_for_payload(stock: str) -> str:
+    detail = insider_detail_for_stock(stock)
+    return (
+        f"activity={detail.get('activity', 'NO_DATA')}; "
+        f"net_qty={detail.get('net_qty', 'NA')}; "
+        f"last_date={detail.get('last_date', 'NA')}"
+    )
+
+
+def build_ai_trade_payload(
+    symbol: str,
+    signal_type: str,
+    market_regime: dict[str, Any] | None,
+    confidence: float,
+    trend_stage: str,
+    move_speed: str,
+    expected_hold: str,
+    theta_risk: str,
+    entry_price: float,
+    stop_loss: float,
+    target: float,
+    current_price: float,
+    rsi: float,
+    atr: float,
+    atr_expansion: float,
+    volume_spike: float,
+    ema_alignment: str,
+    regime_alignment: str,
+    insider_summary: str,
+    instrument_recommendation: str,
+) -> dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "signal_type": signal_type,
+        "market_regime": (market_regime or {}).get("market_type", "UNKNOWN"),
+        "confidence": confidence,
+        "trend_stage": trend_stage,
+        "move_speed": move_speed,
+        "expected_hold": expected_hold,
+        "theta_risk": theta_risk,
+        "entry_price": entry_price,
+        "stop_loss": stop_loss,
+        "target": target,
+        "current_price": current_price,
+        "rsi": rsi,
+        "atr": atr,
+        "atr_expansion": atr_expansion,
+        "volume_spike": volume_spike,
+        "ema_alignment": ema_alignment,
+        "regime_alignment": regime_alignment,
+        "insider_summary": insider_summary,
+        "instrument_recommendation": instrument_recommendation,
+        "future_placeholders": {
+            "news_sentiment": "NOT_IMPLEMENTED",
+            "option_chain_sentiment": "NOT_IMPLEMENTED",
+            "sector_analysis": "NOT_IMPLEMENTED",
+            "earnings_risk": "NOT_IMPLEMENTED",
+        },
+    }
+
+
+def build_ai_sentiment_payload(
+    symbol: str,
+    signal_type: str,
+    market_regime: dict[str, Any] | None,
+    trend_stage: str,
+    insider_summary: str,
+    momentum_context: str,
+    confidence: float,
+) -> dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "signal_type": signal_type,
+        "market_regime": (market_regime or {}).get("market_type", "UNKNOWN"),
+        "regime_direction": (market_regime or {}).get("direction", "UNKNOWN"),
+        "trend_stage": trend_stage,
+        "insider_summary": insider_summary,
+        "momentum_context": momentum_context,
+        "confidence": confidence,
+    }
+
+
+def render_ai_insight_panel(
+    connection: sqlite3.Connection,
+    provider: AIInsightProvider,
+    payload: dict[str, Any],
+    panel_key: str,
+) -> dict[str, Any]:
+    symbol = str(payload.get("symbol", "")).upper()
+    latest = get_latest_ai_insight(connection, symbol, str(provider.provider_name))
+    label = "🔄 Refresh AI Insight" if latest is not None else "🧠 Generate AI Insight"
+    with st.expander("🧠 AI Trade Insight", expanded=False):
+        run_generate = st.button(label, key=f"ai_btn_{panel_key}", use_container_width=True)
+        insight_row = None
+        insight_result = None
+        if run_generate:
+            try:
+                insight_result = generate_or_get_trade_ai_insight(
+                    connection=connection,
+                    provider=provider,
+                    trade_payload=payload,
+                    force_refresh=(latest is not None),
+                )
+                connection.commit()
+            except Exception as exc:
+                st.warning(f"AI insight refresh failed: {exc}")
+        if insight_result is not None:
+            if insight_result["cached"]:
+                st.caption("Using cached AI insight")
+            insight_row = insight_result
+        else:
+            cached = get_cached_ai_insight(
+                connection=connection,
+                symbol=symbol,
+                signal_type=str(payload.get("signal_type", "UNKNOWN")),
+                payload_hash=_ai_payload_hash(payload),
+                provider_name=str(provider.provider_name),
+                ttl_minutes=30,
+            )
+            if cached is not None:
+                st.caption("Using cached AI insight")
+                insight_row = {
+                    "insight_text": str(cached["insight_text"]),
+                    "generated_timestamp": str(cached["generated_timestamp"]),
+                    "provider_name": str(cached["provider_name"]),
+                }
+            elif latest is not None:
+                insight_row = {
+                    "insight_text": str(latest["insight_text"]),
+                    "generated_timestamp": str(latest["generated_timestamp"]),
+                    "provider_name": str(latest["provider_name"]),
+                }
+        if insight_row is None:
+            st.caption("No cached AI insight yet. Click refresh to generate.")
+            return {"generated": bool(run_generate), "shown": False}
+        st.caption(
+            f"Generated: {insight_row['generated_timestamp']} · Provider: {insight_row['provider_name']}"
+        )
+        text_html = html.escape(str(insight_row["insight_text"])).replace("\n", "<br>")
+        st.markdown(
+            f"""
+            <div style="
+                max-height: 260px;
+                overflow-y: auto;
+                border: 1px solid rgba(148, 163, 184, 0.45);
+                border-radius: 10px;
+                padding: 10px 12px;
+                background: rgba(248, 250, 252, 0.75);
+                line-height: 1.45;
+                font-size: 0.9rem;
+            ">{text_html}</div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return {"generated": bool(run_generate), "shown": True}
+
+
+def render_ai_sentiment_panel(
+    connection: sqlite3.Connection,
+    provider: FinancialSentimentProvider,
+    payload: dict[str, Any],
+    panel_key: str,
+) -> None:
+    symbol = str(payload.get("symbol", "")).upper()
+    signal_type = str(payload.get("signal_type", "UNKNOWN"))
+    payload_hash = _ai_payload_hash(payload)
+    provider_name = str(getattr(provider, "provider_name", "financial_sentiment_base"))
+
+    with st.expander("📰 AI News & Sentiment", expanded=False):
+        run_generate = st.button("🧠 Refresh AI Sentiment", key=f"ai_sent_{panel_key}", use_container_width=True)
+        result_row: dict[str, Any] | None = None
+        latest = get_latest_ai_insight(connection, symbol, provider_name)
+        if run_generate:
+            try:
+                sentiment_text = provider.generate_sentiment(payload)
+                saved = save_ai_insight(
+                    connection=connection,
+                    symbol=symbol,
+                    signal_type=signal_type,
+                    payload_hash=payload_hash,
+                    provider_name=provider_name,
+                    insight_text=sentiment_text,
+                )
+                connection.commit()
+                result_row = {
+                    "insight_text": str(saved["insight_text"]),
+                    "generated_timestamp": str(saved["generated_timestamp"]),
+                    "provider_name": str(saved["provider_name"]),
+                }
+            except Exception as exc:
+                st.warning(f"AI sentiment refresh failed: {exc}")
+                if latest is not None:
+                    result_row = {
+                        "insight_text": str(latest["insight_text"]),
+                        "generated_timestamp": str(latest["generated_timestamp"]),
+                        "provider_name": str(latest["provider_name"]),
+                    }
+        else:
+            cached = get_cached_ai_insight(
+                connection=connection,
+                symbol=symbol,
+                signal_type=signal_type,
+                payload_hash=payload_hash,
+                provider_name=provider_name,
+                ttl_minutes=30,
+            )
+            if cached is not None:
+                st.caption("Using cached AI sentiment")
+                result_row = {
+                    "insight_text": str(cached["insight_text"]),
+                    "generated_timestamp": str(cached["generated_timestamp"]),
+                    "provider_name": str(cached["provider_name"]),
+                }
+            elif latest is not None:
+                result_row = {
+                    "insight_text": str(latest["insight_text"]),
+                    "generated_timestamp": str(latest["generated_timestamp"]),
+                    "provider_name": str(latest["provider_name"]),
+                }
+        if result_row is None:
+            st.caption("No cached AI sentiment yet. Click refresh to generate.")
+            return
+        st.caption(
+            f"Generated: {result_row['generated_timestamp']} · Provider: {result_row['provider_name']}"
+        )
+        text_html = html.escape(str(result_row["insight_text"])).replace("\n", "<br>")
+        st.markdown(
+            f"""
+            <div style="
+                max-height: 240px;
+                overflow-y: auto;
+                border: 1px solid rgba(148, 163, 184, 0.45);
+                border-radius: 10px;
+                padding: 10px 12px;
+                background: rgba(248, 250, 252, 0.75);
+                line-height: 1.45;
+                font-size: 0.9rem;
+            ">{text_html}</div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def mark_selected_trade_ai_bootstrap_done(connection: sqlite3.Connection, stock: str) -> None:
+    connection.execute(
+        """
+        UPDATE selected_trades
+        SET ai_auto_insight_done = 1
+        WHERE stock = ?
+        """,
+        (str(stock).upper(),),
+    )
+
+
+def _derive_ema_alignment(signal_type: str, current_price: float, ema20: float, ema50: float) -> str:
+    direction = signal_direction(signal_type)
+    if any(np.isnan(v) for v in (current_price, ema20, ema50)):
+        return "UNKNOWN"
+    if direction == "LONG":
+        if current_price > ema20 >= ema50:
+            return "BULLISH_STACKED"
+        if current_price > ema20:
+            return "BULLISH_PARTIAL"
+        return "BULLISH_WEAK"
+    if direction == "SHORT":
+        if current_price < ema20 <= ema50:
+            return "BEARISH_STACKED"
+        if current_price < ema20:
+            return "BEARISH_PARTIAL"
+        return "BEARISH_WEAK"
+    return "NEUTRAL"
+
+
+def _derive_regime_alignment(signal_type: str, market_regime: dict[str, Any] | None) -> str:
+    direction = signal_direction(signal_type)
+    regime_direction = str((market_regime or {}).get("direction", "UNKNOWN")).upper()
+    if direction not in {"LONG", "SHORT"}:
+        return "UNKNOWN"
+    if (direction == "LONG" and regime_direction == "BULLISH") or (
+        direction == "SHORT" and regime_direction == "BEARISH"
+    ):
+        return "ALIGNED"
+    if regime_direction in {"SIDEWAYS", "UNKNOWN"}:
+        return "NEUTRAL"
+    return "COUNTER_TREND"
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -5225,7 +6056,7 @@ def render_selected_fno_main(signals: pd.DataFrame) -> None:
                 )
 
 
-def render_derivative_analysis_tab(signals: pd.DataFrame) -> None:
+def render_derivative_analysis_tab(signals: pd.DataFrame, market_regime: dict[str, Any] | None = None) -> None:
     st.subheader("📈 Futures & Options Analysis")
     with get_db_connection() as conn:
         init_db(conn)
@@ -5287,9 +6118,48 @@ def render_derivative_analysis_tab(signals: pd.DataFrame) -> None:
         t3.metric("15m RSI", f"{_safe_float(timing.get('rsi_15m'), 0.0):.1f}" if pd.notna(pd.to_numeric(timing.get("rsi_15m"), errors="coerce")) else "—")
         t4.metric("15m ATR", f"{_safe_float(timing.get('atr_15m'), 0.0):,.2f}" if pd.notna(pd.to_numeric(timing.get("atr_15m"), errors="coerce")) else "—")
         st.caption(str(timing.get("confirmation_note", "15m confirmation unavailable")))
+        ai_payload = build_ai_trade_payload(
+            symbol=analysis["symbol"],
+            signal_type=str(analysis.get("signal_type", selected.get("signal_type", "UNKNOWN"))),
+            market_regime=market_regime,
+            confidence=_safe_float(selected.get("signal_metadata", {}).get("confidence"), 0.0),
+            trend_stage=str(selected.get("signal_metadata", {}).get("trend_stage", "UNKNOWN")),
+            move_speed=str(analysis.get("move_speed", "UNKNOWN")),
+            expected_hold=str(analysis.get("hold_bucket", "UNKNOWN")),
+            theta_risk=str(analysis.get("theta_risk", "UNKNOWN")),
+            entry_price=_safe_float(selected.get("signal_metadata", {}).get("entry"), 0.0),
+            stop_loss=_safe_float(selected.get("signal_metadata", {}).get("stop_loss"), 0.0),
+            target=_safe_float(selected.get("signal_metadata", {}).get("target"), 0.0),
+            current_price=_safe_float(selected.get("signal_metadata", {}).get("current_price"), 0.0),
+            rsi=_safe_float(selected.get("signal_metadata", {}).get("rsi"), 0.0),
+            atr=_safe_float(selected.get("signal_metadata", {}).get("atr"), 0.0),
+            atr_expansion=_safe_float(selected.get("signal_metadata", {}).get("atr_expansion"), 1.0),
+            volume_spike=_safe_float(selected.get("signal_metadata", {}).get("volume_spike"), 1.0),
+            ema_alignment=_derive_ema_alignment(
+                str(analysis.get("signal_type", selected.get("signal_type", "UNKNOWN"))),
+                _safe_float(selected.get("signal_metadata", {}).get("current_price"), np.nan),
+                _safe_float(selected.get("signal_metadata", {}).get("ema20"), np.nan),
+                _safe_float(selected.get("signal_metadata", {}).get("ema50"), np.nan),
+            ),
+            regime_alignment=_derive_regime_alignment(
+                str(analysis.get("signal_type", selected.get("signal_type", "UNKNOWN"))),
+                market_regime,
+            ),
+            insider_summary=_insider_summary_for_payload(str(analysis["symbol"])),
+            instrument_recommendation=str(analysis["recommendation"]["best"]),
+        )
+        with get_db_connection() as ai_conn:
+            init_db(ai_conn)
+            provider = get_default_ai_insight_provider()
+            render_ai_insight_panel(
+                connection=ai_conn,
+                provider=provider,
+                payload=ai_payload,
+                panel_key=f"fno_{analysis['symbol']}_{idx}",
+            )
         st.divider()
 
-def render_selected_trades_focus(signals: pd.DataFrame) -> None:
+def render_selected_trades_focus(signals: pd.DataFrame, market_regime: dict[str, Any] | None = None) -> None:
     st.subheader("⭐ SELECTED TRADES")
     with get_db_connection() as conn:
         init_db(conn)
@@ -5301,14 +6171,15 @@ def render_selected_trades_focus(signals: pd.DataFrame) -> None:
             return
         for sel in selected_rows:
             stock = str(sel["stock"]).upper()
-            entry = float(sel["entry_price"])
-            sl = float(sel["stop_loss"])
-            tgt = float(sel["target"])
+            entry = _first_numeric(sel["original_entry_price"], sel["entry_price"])
+            sl = _first_numeric(sel["original_stop_loss"], sel["stop_loss"])
+            tgt = _first_numeric(sel["original_target"], sel["target"])
+            original_signal = str(sel["original_signal_type"] or sel["signal_type"] or "")
             live = signals_row_for_stock(signals, stock)
-            if live is not None and is_trade_signal(str(live.get("Signal", ""))):
-                direction = signal_direction(str(live["Signal"]))
-            else:
-                direction = direction_from_stored_signal_type(str(sel["signal_type"] or ""))
+            direction = signal_direction(original_signal)
+            if direction == "WAIT":
+                direction = direction_from_stored_signal_type(original_signal)
+            live_plan = _selected_trade_live_plan(sel, live)
 
             cur_price = float(live["Current Price"]) if live is not None else np.nan
             ema50v = np.nan
@@ -5343,14 +6214,23 @@ def render_selected_trades_focus(signals: pd.DataFrame) -> None:
                 else '<div class="focus-banner" style="color:#1b5e20;">✅ HOLD</div>'
             )
             dir_label = direction if direction != "WAIT" else "—"
+            live_entry_s = f"{live_plan['entry']:,.2f}" if pd.notna(pd.to_numeric(live_plan["entry"], errors="coerce")) else "—"
+            live_sl_s = f"{live_plan['stop_loss']:,.2f}" if pd.notna(pd.to_numeric(live_plan["stop_loss"], errors="coerce")) else "—"
+            live_target_s = f"{live_plan['target']:,.2f}" if pd.notna(pd.to_numeric(live_plan["target"], errors="coerce")) else "—"
+            changes_html = "".join(f"<div class=\"card-line\">{html.escape(str(change))}</div>" for change in live_plan["changes"])
 
             st.markdown(
                 f"""
                 <div class="selected-focus-card">
                     <div class="card-stock">{stock}</div>
-                    <div class="card-line">Direction <strong>{dir_label}</strong></div>
-                    <div class="card-line">Entry <strong>{entry:,.2f}</strong> · Current <strong>{price_s}</strong> · P&amp;L <strong>{pnl_s}</strong></div>
-                    <div class="card-line">Stop loss <strong>{sl:,.2f}</strong> · Target <strong>{tgt:,.2f}</strong></div>
+                    <div class="card-line">Direction <strong>{dir_label}</strong> · Current <strong>{price_s}</strong> · P&amp;L <strong>{pnl_s}</strong></div>
+                    <div class="card-line"><strong>Original Trade Plan</strong></div>
+                    <div class="card-line">Entry <strong>{entry:,.2f}</strong> · SL <strong>{sl:,.2f}</strong> · Target <strong>{tgt:,.2f}</strong></div>
+                    <div class="card-line">Signal at selection <strong>{html.escape(original_signal or '—')}</strong></div>
+                    <div class="card-line"><strong>Current System Recommendation</strong></div>
+                    <div class="card-line">Entry <strong>{live_entry_s}</strong> · SL <strong>{live_sl_s}</strong> · Target <strong>{live_target_s}</strong></div>
+                    <div class="card-line">Current signal <strong>{html.escape(str(live_plan['signal'] or '—'))}</strong> · Status <strong>{html.escape(str(live_plan['status']))}</strong></div>
+                    {changes_html}
                     <div class="card-line">Distance from SL (vs entry %): <strong>{dist_sl_s}</strong></div>
                     <div class="card-line">Distance from target (vs entry %): <strong>{dist_tgt_s}</strong></div>
                     {banner_html}
@@ -5366,9 +6246,93 @@ def render_selected_trades_focus(signals: pd.DataFrame) -> None:
                     st.rerun()
             with c2:
                 if st.button("Mark as Closed", key=f"sel_closed_{stock}"):
-                    mark_selected_trade_closed_manual(conn, stock)
+                    mark_selected_trade_closed_manual(conn, stock, cur_price if not np.isnan(cur_price) else None)
                     conn.commit()
                     st.rerun()
+            signal_for_payload = str(
+                live_plan.get("signal")
+                or original_signal
+                or sel.get("signal_type")
+                or "UNKNOWN"
+            )
+            confidence_val = _safe_float(
+                sel["confidence_score"] if "confidence_score" in sel.keys() else np.nan,
+                0.0,
+            )
+            if pd.isna(confidence_val):
+                confidence_val = 0.0
+            stage_val = str(live.get("trend_stage", "UNKNOWN")) if live is not None else "UNKNOWN"
+            move_speed = "UNKNOWN"
+            expected_hold = "UNKNOWN"
+            theta_risk = "UNKNOWN"
+            instrument_reco = "UNKNOWN"
+            if live is not None:
+                selected_payload = selected_fno_payload_from_db_row(
+                    {"stock": stock, "signal_type": signal_for_payload, "signal_metadata": "{}"},
+                    signals,
+                )
+                analysis = run_derivative_analysis(selected_payload, signals)
+                move_speed = str(analysis.get("move_speed", "UNKNOWN"))
+                expected_hold = str(analysis.get("hold_bucket", "UNKNOWN"))
+                theta_risk = str(analysis.get("theta_risk", "UNKNOWN"))
+                instrument_reco = str(analysis.get("recommendation", {}).get("best", "UNKNOWN"))
+            ai_payload = build_ai_trade_payload(
+                symbol=stock,
+                signal_type=signal_for_payload,
+                market_regime=market_regime,
+                confidence=float(confidence_val),
+                trend_stage=stage_val,
+                move_speed=move_speed,
+                expected_hold=expected_hold,
+                theta_risk=theta_risk,
+                entry_price=_safe_float(entry, 0.0),
+                stop_loss=_safe_float(sl, 0.0),
+                target=_safe_float(tgt, 0.0),
+                current_price=_safe_float(cur_price, 0.0) if not np.isnan(cur_price) else 0.0,
+                rsi=_safe_float(rsiv, 0.0) if not np.isnan(rsiv) else 0.0,
+                atr=_safe_float(float(live.get("ATR", np.nan)) if live is not None else np.nan, 0.0),
+                atr_expansion=_safe_float(float(live.get("ATR Expansion", np.nan)) if live is not None else np.nan, 1.0),
+                volume_spike=_safe_float(float(live.get("Volume Spike", np.nan)) if live is not None else np.nan, 1.0),
+                ema_alignment=_derive_ema_alignment(
+                    signal_for_payload,
+                    _safe_float(cur_price, np.nan),
+                    _safe_float(float(live.get("EMA20", np.nan)) if live is not None else np.nan, np.nan),
+                    _safe_float(ema50v, np.nan),
+                ),
+                regime_alignment=_derive_regime_alignment(signal_for_payload, market_regime),
+                insider_summary=_insider_summary_for_payload(stock),
+                instrument_recommendation=instrument_reco,
+            )
+            provider = get_default_ai_insight_provider()
+            render_ai_insight_panel(
+                connection=conn,
+                provider=provider,
+                payload=ai_payload,
+                panel_key=f"selected_{stock}",
+            )
+            momentum_context = (
+                f"signal={signal_for_payload}; "
+                f"rsi={_safe_float(rsiv, 0.0) if not np.isnan(rsiv) else 0.0:.2f}; "
+                f"price={_safe_float(cur_price, 0.0) if not np.isnan(cur_price) else 0.0:.2f}; "
+                f"ema50={_safe_float(ema50v, 0.0) if not np.isnan(ema50v) else 0.0:.2f}; "
+                f"live_status={live_plan.get('status', 'UNKNOWN')}"
+            )
+            sentiment_payload = build_ai_sentiment_payload(
+                symbol=stock,
+                signal_type=signal_for_payload,
+                market_regime=market_regime,
+                trend_stage=stage_val,
+                insider_summary=_insider_summary_for_payload(stock),
+                momentum_context=momentum_context,
+                confidence=float(confidence_val),
+            )
+            sentiment_provider = get_default_financial_sentiment_provider()
+            render_ai_sentiment_panel(
+                connection=conn,
+                provider=sentiment_provider,
+                payload=sentiment_payload,
+                panel_key=f"selected_sent_{stock}",
+            )
 
 
 def render_trade_explain_body(row: pd.Series) -> None:
@@ -5929,7 +6893,7 @@ def main() -> None:
     main_tab, derivative_tab = st.tabs(["📊 Main Dashboard", "📈 Futures & Options Analysis"])
 
     with main_tab:
-        render_selected_trades_focus(signals)
+        render_selected_trades_focus(signals, regime)
         render_selected_fno_main(signals)
         render_top_trade_highlight(signals)
         render_market_regime(regime, signals, last_updated)
@@ -5953,7 +6917,7 @@ def main() -> None:
         render_runtime_log_tail(100)
 
     with derivative_tab:
-        render_derivative_analysis_tab(signals)
+        render_derivative_analysis_tab(signals, regime)
 
 
 if __name__ == "__main__":
