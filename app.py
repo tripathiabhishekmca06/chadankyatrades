@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import http.cookiejar
+import html
 import json
 import logging
 import os
 import re
+import socket
 import sqlite3
 import sys
 import threading
@@ -159,6 +161,7 @@ EODHD_API_MINUTE_LIMIT = 20
 CACHE_TTL = 60.0
 YAHOO_FETCH_CACHE_TTL_SECONDS = CACHE_TTL
 YAHOO_MIN_CALL_GAP_SECONDS = 2.0
+NETWORK_REQUEST_TIMEOUT_SECONDS = 8
 API_USAGE_STATE_KEY = "_api_usage_tracker_v1"
 API_USAGE_PERSIST_PATH = DATA_DIR / "api_usage_state.json"
 MARKET_SESSION_CACHE_TTL = 90.0
@@ -182,6 +185,10 @@ _YAHOO_FETCH_CACHE: dict[tuple[Any, ...], tuple[float, pd.DataFrame]] = {}
 _YAHOO_CACHE_LOCK = threading.Lock()
 # Set when Alpha returns a premium / unavailable intraday message so we skip further intraday calls.
 _ALPHA_INTRADAY_BLOCKED = False
+# Set when network/proxy blocks Alpha intraday endpoint in current process.
+_ALPHA_NETWORK_BLOCKED = False
+_EODHD_NETWORK_BLOCKED = False
+_PROVIDER_STATUS: dict[str, str] = {}
 # EODHD ``BASE.suffix`` for India (resolved once; override with EODHD_NSE_EXCHANGE_CODE).
 _EODHD_NSE_EXCHANGE_SUFFIX: str | None = None
 _EODHD_SUFFIX_LOCK = threading.Lock()
@@ -497,7 +504,7 @@ def _ensure_eodhd_nse_exchange_suffix(session: requests.Session | None = None) -
     EODHD uses ``BASE.EXCHANGE``; NSE India is usually ``.NSE`` but some accounts/eras use
     other codes. Probe once per process (override with env EODHD_NSE_EXCHANGE_CODE).
     """
-    global _EODHD_NSE_EXCHANGE_SUFFIX
+    global _EODHD_NSE_EXCHANGE_SUFFIX, _EODHD_NETWORK_BLOCKED
     if _EODHD_NSE_EXCHANGE_SUFFIX is not None:
         return _EODHD_NSE_EXCHANGE_SUFFIX
     with _EODHD_SUFFIX_LOCK:
@@ -519,11 +526,16 @@ def _ensure_eodhd_nse_exchange_suffix(session: requests.Session | None = None) -
                 r = sess.get(
                     f"https://eodhd.com/api/eod/{probe}",
                     params={"api_token": EODHD_API_KEY, "period": "d", "fmt": "json"},
-                    timeout=20,
+                    timeout=NETWORK_REQUEST_TIMEOUT_SECONDS,
                 )
                 record_eodhd_api_calls(1)
             except Exception as exc:
-                logger.info("EODHD exchange probe failed for %s: %s", probe, exc)
+                logger.info("EODHD exchange probe failed for %s: %s", probe, _sanitize_provider_error(exc))
+                if _is_dns_or_network_block_error(exc):
+                    _EODHD_NETWORK_BLOCKED = True
+                    _mark_provider_status("EODHD", "network/DNS unavailable")
+                    logger.warning("EODHD appears network/DNS blocked; skipping further EODHD calls this run.")
+                    break
                 continue
             if not r.ok:
                 continue
@@ -688,16 +700,67 @@ def _yahoo_cache_set(key: tuple[Any, ...], frame: pd.DataFrame) -> None:
         _YAHOO_FETCH_CACHE[key] = (time.time(), frame.copy())
 
 
-def _yahoo_dns_ok() -> bool:
-    """Best-effort DNS probe for Yahoo cookie/consent host used by yfinance."""
-    try:
-        import socket
+def _mark_provider_status(provider: str, message: str) -> None:
+    if not provider:
+        return
+    _PROVIDER_STATUS[str(provider).upper()] = str(message).strip()
 
-        socket.getaddrinfo("guce.yahoo.com", 443)
+
+def _is_proxy_block_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    needles = (
+        "proxyerror",
+        "tunnel connection failed",
+        "unable to connect to proxy",
+        "connect tunnel failed",
+        "407 proxy",
+        "403 forbidden",
+    )
+    return any(part in msg for part in needles)
+
+
+def _is_dns_or_network_block_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    needles = (
+        "nameresolutionerror",
+        "failed to resolve",
+        "nodename nor servname",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "getaddrinfo failed",
+        "could not resolve host",
+    )
+    return _is_proxy_block_error(exc) or any(part in msg for part in needles)
+
+
+def _sanitize_provider_error(exc: Exception | str) -> str:
+    msg = str(exc)
+    msg = re.sub(r"([?&](?:apikey|api_token)=)[^&\s)]+", r"\1***", msg, flags=re.IGNORECASE)
+    return msg
+
+
+def _provider_dns_ok(host: str, provider: str) -> bool:
+    try:
+        socket.getaddrinfo(host, 443)
         return True
     except Exception as exc:
-        logger.warning("Yahoo DNS probe failed for guce.yahoo.com: %s", exc)
+        logger.warning("%s DNS probe failed for %s: %s", provider, host, _sanitize_provider_error(exc))
+        _mark_provider_status(provider, "network/DNS unavailable")
         return False
+
+
+def _provider_unavailable_messages() -> list[str]:
+    labels = {
+        "YAHOO": "Yahoo unavailable",
+        "ALPHA": "Alpha Vantage unavailable",
+        "EODHD": "EODHD unavailable",
+    }
+    messages = []
+    for key in ("YAHOO", "ALPHA", "EODHD"):
+        reason = _PROVIDER_STATUS.get(key)
+        if reason:
+            messages.append(f"{labels[key]}: {reason}")
+    return messages
 
 
 def _fetch_alpha_intraday(
@@ -720,7 +783,11 @@ def _fetch_alpha_intraday(
         "apikey": ALPHA_API_KEY,
     }
     sess = session if session is not None else requests
-    response = sess.get("https://www.alphavantage.co/query", params=params, timeout=20)
+    response = sess.get(
+        "https://www.alphavantage.co/query",
+        params=params,
+        timeout=NETWORK_REQUEST_TIMEOUT_SECONDS,
+    )
     record_alpha_api_call()
     if not response.ok:
         logger.warning(
@@ -782,7 +849,11 @@ def _fetch_alpha_daily(
         "apikey": ALPHA_API_KEY,
     }
     sess = session if session is not None else requests
-    response = sess.get("https://www.alphavantage.co/query", params=params, timeout=20)
+    response = sess.get(
+        "https://www.alphavantage.co/query",
+        params=params,
+        timeout=NETWORK_REQUEST_TIMEOUT_SECONDS,
+    )
     record_alpha_api_call()
     if not response.ok:
         logger.warning("API Alpha Vantage: daily HTTP %s for %s", response.status_code, sym)
@@ -818,6 +889,8 @@ def _fetch_eodhd_intraday_or_daily(
 ) -> tuple[pd.DataFrame, int]:
     if not EODHD_API_KEY:
         return pd.DataFrame(columns=OHLCV_COLUMNS), 0
+    if _EODHD_NETWORK_BLOCKED:
+        return pd.DataFrame(columns=OHLCV_COLUMNS), 0
     sess = session if session is not None else requests
     eod_symbol = _to_eodhd_symbol(market_ticker, sess)
     eod_iv = _map_interval_to_eodhd(interval)
@@ -828,7 +901,11 @@ def _fetch_eodhd_intraday_or_daily(
     intraday_url = f"https://eodhd.com/api/intraday/{eod_symbol}"
     intraday_params = {"api_token": EODHD_API_KEY, "interval": eod_iv, "fmt": "json"}
     logger.debug("API EODHD: intraday GET %s interval=%s throttle=%s", eod_symbol, eod_iv, throttle)
-    intraday_resp = sess.get(intraday_url, params=intraday_params, timeout=20)
+    intraday_resp = sess.get(
+        intraday_url,
+        params=intraday_params,
+        timeout=NETWORK_REQUEST_TIMEOUT_SECONDS,
+    )
     http_calls += 1
     if intraday_resp.ok:
         try:
@@ -889,7 +966,11 @@ def _fetch_eodhd_intraday_or_daily(
     daily_url = f"https://eodhd.com/api/eod/{eod_symbol}"
     daily_params = {"api_token": EODHD_API_KEY, "period": "d", "fmt": "json"}
     logger.debug("API EODHD: daily EOD GET %s (intraday empty or missing)", eod_symbol)
-    daily_resp = sess.get(daily_url, params=daily_params, timeout=20)
+    daily_resp = sess.get(
+        daily_url,
+        params=daily_params,
+        timeout=NETWORK_REQUEST_TIMEOUT_SECONDS,
+    )
     http_calls += 1
     if not daily_resp.ok:
         logger.warning(
@@ -1047,7 +1128,24 @@ def get_market_data(symbols: tuple[str, ...], interval: str = "15m", period: str
     yahoo_success = 0
     alpha_success = 0
     eodhd_success = 0
+    global _ALPHA_NETWORK_BLOCKED, _EODHD_NETWORK_BLOCKED
     logged_alpha_limit = False
+    _PROVIDER_STATUS.clear()
+    if _ALPHA_NETWORK_BLOCKED:
+        _mark_provider_status("ALPHA", "network/DNS unavailable")
+    if _EODHD_NETWORK_BLOCKED:
+        _mark_provider_status("EODHD", "network/DNS unavailable")
+    if ALPHA_API_KEY and not _ALPHA_NETWORK_BLOCKED and not _provider_dns_ok("www.alphavantage.co", "ALPHA"):
+        _ALPHA_NETWORK_BLOCKED = True
+    if EODHD_API_KEY and not _EODHD_NETWORK_BLOCKED and not _provider_dns_ok("eodhd.com", "EODHD"):
+        _EODHD_NETWORK_BLOCKED = True
+    yahoo_dns_ok = _provider_dns_ok("guce.yahoo.com", "YAHOO")
+    logger.info(
+        "get_market_data: provider preflight alpha_blocked=%s eodhd_blocked=%s yahoo_dns_ok=%s",
+        _ALPHA_NETWORK_BLOCKED,
+        _EODHD_NETWORK_BLOCKED,
+        yahoo_dns_ok,
+    )
 
     with requests.Session() as http_session:
         # 1) Yahoo batch for all symbols.
@@ -1055,18 +1153,19 @@ def get_market_data(symbols: tuple[str, ...], interval: str = "15m", period: str
         yahoo_iv = _map_interval_to_yahoo(interval)
         yahoo_period = _map_period_to_yahoo(period)
         try:
-            if not _yahoo_dns_ok():
-                logger.warning("Yahoo fetch skipped/likely empty: guce.yahoo.com DNS failed in this environment")
-            _yahoo_rate_limit_wait()
-            yahoo_payload = yf.download(
-                tickers=list(tickers),
-                period=yahoo_period,
-                interval=yahoo_iv,
-                auto_adjust=False,
-                group_by="ticker",
-                threads=True,
-                progress=False,
-            )
+            if yahoo_dns_ok:
+                _yahoo_rate_limit_wait()
+                yahoo_payload = yf.download(
+                    tickers=list(tickers),
+                    period=yahoo_period,
+                    interval=yahoo_iv,
+                    auto_adjust=False,
+                    group_by="ticker",
+                    threads=True,
+                    progress=False,
+                )
+            else:
+                logger.warning("Yahoo fetch skipped because guce.yahoo.com DNS is unavailable.")
             logger.info(
                 "Yahoo batch download complete symbols=%s period=%s interval=%s shape=%s",
                 n_sym,
@@ -1074,7 +1173,7 @@ def get_market_data(symbols: tuple[str, ...], interval: str = "15m", period: str
                 yahoo_iv,
                 yahoo_payload.shape if isinstance(yahoo_payload, pd.DataFrame) else None,
             )
-            if isinstance(yahoo_payload, pd.DataFrame) and yahoo_payload.empty:
+            if yahoo_dns_ok and isinstance(yahoo_payload, pd.DataFrame) and yahoo_payload.empty:
                 logger.warning(
                     "Yahoo batch returned empty frame for symbols=%s period=%s interval=%s; "
                     "if stderr shows 'Could not resolve host: guce.yahoo.com', DNS/network blocks Yahoo consent host.",
@@ -1082,8 +1181,10 @@ def get_market_data(symbols: tuple[str, ...], interval: str = "15m", period: str
                     yahoo_period,
                     yahoo_iv,
                 )
+                _mark_provider_status("YAHOO", "no data returned from Yahoo Finance")
         except Exception as exc:
             logger.info("Yahoo batch download failed; will use Alpha/EODHD fallback: %s", exc)
+            _mark_provider_status("YAHOO", str(exc))
             yahoo_payload = pd.DataFrame()
 
         missing_after_yahoo: list[tuple[str, str]] = []
@@ -1100,7 +1201,11 @@ def get_market_data(symbols: tuple[str, ...], interval: str = "15m", period: str
         for raw_sym, ticker in missing_after_yahoo:
             frame = pd.DataFrame(columns=OHLCV_COLUMNS)
             use_alpha_intraday = False
-            if ALPHA_API_KEY and not _ALPHA_INTRADAY_BLOCKED:
+            if (
+                ALPHA_API_KEY
+                and not _ALPHA_INTRADAY_BLOCKED
+                and not _ALPHA_NETWORK_BLOCKED
+            ):
                 try:
                     du = compute_api_usage_display()
                     if str(du.get("alpha_status")) == "BLOCKED" or int(du.get("alpha_minute_remaining", 0)) <= 0:
@@ -1118,21 +1223,31 @@ def get_market_data(symbols: tuple[str, ...], interval: str = "15m", period: str
                 try:
                     frame = _fetch_alpha_intraday(ticker, interval, http_session)
                 except Exception as exc:
-                    logger.info("Alpha Vantage intraday failed for %s: %s", ticker, exc)
+                    safe_exc = _sanitize_provider_error(exc)
+                    logger.info("Alpha Vantage intraday failed for %s: %s", ticker, safe_exc)
+                    _mark_provider_status("ALPHA", safe_exc)
+                    if _is_dns_or_network_block_error(exc):
+                        _ALPHA_NETWORK_BLOCKED = True
+                        logger.warning(
+                            "Alpha intraday appears network/DNS blocked; skipping further Alpha calls this run."
+                        )
                     frame = pd.DataFrame(columns=OHLCV_COLUMNS)
                 if not frame.empty:
                     alpha_success += 1
                     frames_by_ticker[ticker] = frame
+                elif use_alpha_intraday and "ALPHA" not in _PROVIDER_STATUS:
+                    _mark_provider_status("ALPHA", "no data returned from Alpha Vantage")
 
             if frame.empty:
                 missing_after_alpha.append((raw_sym, ticker))
 
         # 3) EODHD fallback for symbols still missing after Alpha (small thread pool).
         eod_http_total = 0
-        if missing_after_alpha and EODHD_API_KEY:
+        if missing_after_alpha and EODHD_API_KEY and not _EODHD_NETWORK_BLOCKED:
             workers = min(EODHD_FALLBACK_MAX_WORKERS, max(1, len(missing_after_alpha)))
 
             def _eod_one(item: tuple[str, str]) -> tuple[str, str, pd.DataFrame, int]:
+                global _EODHD_NETWORK_BLOCKED
                 raw_sym, ticker = item
                 sess = requests.Session()
                 try:
@@ -1141,18 +1256,32 @@ def get_market_data(symbols: tuple[str, ...], interval: str = "15m", period: str
                     )
                     return raw_sym, ticker, frame, int(n_http)
                 except Exception as exc:
-                    logger.info("EODHD fetch failed for %s: %s", ticker, exc)
+                    safe_exc = _sanitize_provider_error(exc)
+                    logger.info("EODHD fetch failed for %s: %s", ticker, safe_exc)
+                    _mark_provider_status("EODHD", safe_exc)
+                    if _is_dns_or_network_block_error(exc):
+                        _EODHD_NETWORK_BLOCKED = True
+                        _mark_provider_status("EODHD", "network/DNS unavailable")
                     return raw_sym, ticker, pd.DataFrame(columns=OHLCV_COLUMNS), 0
 
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = [executor.submit(_eod_one, item) for item in missing_after_alpha]
-                for fut in as_completed(futures):
+                total_fallback = len(futures)
+                for i, fut in enumerate(as_completed(futures), start=1):
                     raw_sym, ticker, frame, nh = fut.result()
                     eod_http_total += int(nh)
                     if not frame.empty:
                         eodhd_success += 1
                         frames_by_ticker[ticker] = frame
-
+                    elif "EODHD" not in _PROVIDER_STATUS:
+                        _mark_provider_status("EODHD", "no data returned from EODHD")
+                    if i == 1 or i % 10 == 0 or i == total_fallback:
+                        logger.info(
+                            "get_market_data: EODHD fallback progress %s/%s (success=%s)",
+                            i,
+                            total_fallback,
+                            eodhd_success,
+                        )
         if eod_http_total:
             record_eodhd_api_calls(eod_http_total)
 
@@ -1212,11 +1341,14 @@ def download_market_data(symbols: tuple[str, ...], period: str, interval: str) -
 
 def clear_market_data_cache() -> None:
     global _ALPHA_LAST_CALL_TS, _EODHD_LAST_CALL_TS, _YAHOO_LAST_CALL_TS
-    global _ALPHA_INTRADAY_BLOCKED, _EODHD_NSE_EXCHANGE_SUFFIX
+    global _ALPHA_INTRADAY_BLOCKED, _ALPHA_NETWORK_BLOCKED, _EODHD_NETWORK_BLOCKED, _EODHD_NSE_EXCHANGE_SUFFIX
     _ALPHA_LAST_CALL_TS = 0.0
     _EODHD_LAST_CALL_TS = 0.0
     _YAHOO_LAST_CALL_TS = 0.0
     _ALPHA_INTRADAY_BLOCKED = False
+    _ALPHA_NETWORK_BLOCKED = False
+    _EODHD_NETWORK_BLOCKED = False
+    _PROVIDER_STATUS.clear()
     _EODHD_NSE_EXCHANGE_SUFFIX = None
     with _YAHOO_CACHE_LOCK:
         _YAHOO_FETCH_CACHE.clear()
@@ -2795,6 +2927,18 @@ def init_db(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_selected_status ON selected_trades(status)"
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS selected_fno_stocks (
+            stock TEXT PRIMARY KEY,
+            signal_type TEXT,
+            selected_timestamp TEXT
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_selected_fno_ts ON selected_fno_stocks(selected_timestamp)"
+    )
     connection.commit()
 
 
@@ -2944,6 +3088,35 @@ def mark_selected_trade_closed_manual(connection: sqlite3.Connection, stock: str
         "UPDATE selected_trades SET status = 'CLOSED' WHERE stock = ?",
         (str(stock).upper(),),
     )
+
+
+def get_selected_fno_stocks(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT stock, signal_type, selected_timestamp
+        FROM selected_fno_stocks
+        ORDER BY selected_timestamp DESC
+        """
+    ).fetchall()
+
+
+def insert_selected_fno_from_row(connection: sqlite3.Connection, row: pd.Series, signal_type: str) -> bool:
+    stock = str(row.get("Stock", "")).upper()
+    if not stock:
+        return False
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur = connection.execute(
+        """
+        INSERT OR REPLACE INTO selected_fno_stocks (stock, signal_type, selected_timestamp)
+        VALUES (?, ?, ?)
+        """,
+        (stock, str(row.get("Signal", signal_type or "UNKNOWN")), ts),
+    )
+    return (cur.rowcount or 0) > 0
+
+
+def delete_selected_fno_stock(connection: sqlite3.Connection, stock: str) -> None:
+    connection.execute("DELETE FROM selected_fno_stocks WHERE stock = ?", (str(stock).upper(),))
 
 
 def signals_row_for_stock(signals: pd.DataFrame, stock: str) -> pd.Series | None:
@@ -3717,15 +3890,19 @@ def scan_symbols(
     rows = []
     errors = []
     no_data_symbols: list[str] = []
+    scan_started = time.perf_counter()
 
     market_data = pd.DataFrame()
     if not use_sample_data:
+        download_started = time.perf_counter()
+        logger.info("scan_symbols: downloading market data for %s symbols", len(symbols))
         try:
             market_data = download_market_data(tuple(symbols), period, interval)
             logger.info(
-                "scan_symbols: market_data ready shape=%s empty=%s",
+                "scan_symbols: market_data ready shape=%s empty=%s download_elapsed_s=%.2f",
                 market_data.shape if isinstance(market_data, pd.DataFrame) else None,
                 market_data.empty if isinstance(market_data, pd.DataFrame) else True,
+                time.perf_counter() - download_started,
             )
         except Exception as exc:
             logger.exception("scan_symbols: Market data download failed: %s", exc)
@@ -3735,7 +3912,8 @@ def scan_symbols(
     else:
         logger.info("scan_symbols: using synthetic sample history (no download_market_data)")
 
-    for symbol in symbols:
+    total_symbols = len(symbols)
+    for idx, symbol in enumerate(symbols, start=1):
         try:
             history = (
                 make_sample_history(symbol)
@@ -3752,6 +3930,16 @@ def scan_symbols(
         except Exception as exc:
             errors.append(f"{symbol}: {exc}")
             logger.exception("Skipping %s", symbol)
+        if idx == 1 or idx % 10 == 0 or idx == total_symbols:
+            logger.info(
+                "scan_symbols: progress %s/%s rows=%s no_data=%s errors=%s elapsed_s=%.2f",
+                idx,
+                total_symbols,
+                len(rows),
+                len(no_data_symbols),
+                len(errors),
+                time.perf_counter() - scan_started,
+            )
 
     if not rows:
         if no_data_symbols and not use_sample_data:
@@ -3760,18 +3948,24 @@ def scan_symbols(
                 len(no_data_symbols),
                 len(errors),
             )
-            return empty_futures_table(), errors + [
+            details = errors.copy()
+            provider_messages = _provider_unavailable_messages()
+            if provider_messages:
+                details = provider_messages + details
+            details.append(
                 f"No valid symbol data found: {len(no_data_symbols)} symbols returned no candles from Alpha Vantage / EODHD. "
                 "Check network/API keys and quotas, or enable 'Use sample data'."
-            ]
+            )
+            return empty_futures_table(), details
         logger.warning("scan_symbols: no signal rows; errors=%s", len(errors))
         return empty_futures_table(), errors or ["No valid symbol data found"]
 
     logger.info(
-        "scan_symbols: success signal_rows=%s errors=%s no_data_symbols=%s",
+        "scan_symbols: success signal_rows=%s errors=%s no_data_symbols=%s total_elapsed_s=%.2f",
         len(rows),
         len(errors),
         len(no_data_symbols),
+        time.perf_counter() - scan_started,
     )
     return sort_futures_table(pd.DataFrame(rows)), errors
 
@@ -4177,6 +4371,523 @@ def _failed_messages(raw: Any) -> list[str]:
     return []
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    numeric = pd.to_numeric(value, errors="coerce")
+    return float(numeric) if pd.notna(numeric) else float(default)
+
+
+def derivative_selection_payload(row: pd.Series, signal_type: str) -> dict[str, Any]:
+    return {
+        "symbol": str(row.get("Stock", "")).upper(),
+        "signal_type": signal_type,
+        "confidence": int(_safe_float(row.get("Confidence Score"), 0)),
+        "trend_strength": _safe_float(row.get("trend_strength"), 0.0),
+        "signal_metadata": {
+            "signal": str(row.get("Signal", "")),
+            "strategy_type": str(row.get("Signal Type", "")),
+            "trend_stage": str(row.get("trend_stage", "")),
+            "trend_watch_direction": str(row.get("trend_watch_direction", "")),
+            "entry": _safe_float(row.get("Entry"), 0.0),
+            "current_price": _safe_float(row.get("Current Price"), 0.0),
+            "atr": _safe_float(row.get("ATR"), 0.0),
+            "volume_strength": _safe_float(row.get("Volume Strength"), 0.0),
+            "rsi": _safe_float(row.get("RSI"), 50.0),
+            "ema20": _safe_float(row.get("EMA20"), 0.0),
+            "ema50": _safe_float(row.get("EMA50"), 0.0),
+            "distance_from_ema20_pct": _safe_float(row.get("Distance from EMA20 %"), 0.0),
+            "structure_break": bool(row.get("Structure Break", False)),
+            "market_structure": str(row.get("Market Structure", "")),
+        },
+    }
+
+
+def derivative_move_speed_label(score: float) -> str:
+    if score >= 3.5:
+        return "FAST"
+    if score >= 2.2:
+        return "MEDIUM"
+    return "SLOW"
+
+
+def derivative_hold_bucket(speed: str, trend_strength: float) -> str:
+    if speed == "FAST":
+        return "Intraday" if trend_strength < 0.02 else "1-2 days"
+    if speed == "MEDIUM":
+        return "1-2 days" if trend_strength < 0.03 else "3-5 days"
+    return "3-5 days" if trend_strength < 0.04 else "1+ week"
+
+
+def derivative_theta_risk_label(hold_bucket: str) -> str:
+    high_buckets = {"3-5 days", "1+ week"}
+    if hold_bucket in high_buckets:
+        return "HIGH"
+    if hold_bucket == "1-2 days":
+        return "MEDIUM"
+    return "LOW"
+
+
+def derive_instrument_recommendation(speed: str, trend_direction: str) -> dict[str, str]:
+    suffix = "CE" if trend_direction == "LONG" else "PE"
+    if speed == "FAST":
+        return {
+            "best": f"ATM {suffix} option",
+            "alternate": f"Slight ITM {suffix} option",
+            "avoid": "Deep ITM option / Futures lag move",
+        }
+    if speed == "MEDIUM":
+        return {
+            "best": f"ITM {suffix} option",
+            "alternate": "Futures",
+            "avoid": f"Far OTM {suffix}",
+        }
+    return {
+        "best": "Futures",
+        "alternate": f"Deep ITM {suffix}",
+        "avoid": f"ATM {suffix}",
+    }
+
+
+def run_derivative_analysis(selected: dict[str, Any], signals: pd.DataFrame) -> dict[str, Any]:
+    symbol = str(selected.get("symbol", "")).upper()
+    row = signals_row_for_stock(signals, symbol)
+    metadata = dict(selected.get("signal_metadata", {}))
+    if row is not None:
+        metadata = derivative_selection_payload(row, str(selected.get("signal_type", "UNKNOWN"))).get("signal_metadata", {})
+    trend_direction = signal_direction(str(metadata.get("signal", "")))
+    trend_direction = trend_direction if trend_direction in {"LONG", "SHORT"} else "WAIT"
+    atr = _safe_float(metadata.get("atr"), 0.0)
+    current_price = _safe_float(metadata.get("current_price"), 0.0)
+    volume_strength = _safe_float(metadata.get("volume_strength"), 1.0)
+    rsi = _safe_float(metadata.get("rsi"), 50.0)
+    ema20 = _safe_float(metadata.get("ema20"), 0.0)
+    ema50 = _safe_float(metadata.get("ema50"), 0.0)
+    distance_pct = abs(_safe_float(metadata.get("distance_from_ema20_pct"), 0.0))
+    structure_break = bool(metadata.get("structure_break", False))
+    trend_strength = _safe_float(selected.get("trend_strength"), _safe_float(metadata.get("trend_strength"), 0.0))
+
+    atr_expansion = (atr / current_price) if current_price > 0 else 0.0
+    rsi_acceleration = abs(rsi - 50.0) / 50.0
+    ema_slope = abs((ema20 - ema50) / ema50) if ema50 > 0 else 0.0
+    breakout_strength = (1.0 if structure_break else 0.0) + min(distance_pct / 5.0, 1.0)
+    volume_spike = max(volume_strength - 1.0, 0.0)
+
+    score = (
+        min(atr_expansion / 0.02, 1.0)
+        + min(volume_spike / 1.0, 1.0)
+        + min(rsi_acceleration / 0.35, 1.0)
+        + min(ema_slope / 0.03, 1.0)
+        + min(breakout_strength / 2.0, 1.0)
+    )
+
+    if trend_direction == "WAIT":
+        move_speed = "SIDEWAYS"
+    else:
+        move_speed = derivative_move_speed_label(score)
+    hold_bucket = derivative_hold_bucket(move_speed, trend_strength) if move_speed != "SIDEWAYS" else "1+ week"
+    theta_risk = derivative_theta_risk_label(hold_bucket)
+
+    recommendation = (
+        {"best": "Avoid option buying", "alternate": "Wait for directional setup", "avoid": "ATM option buying"}
+        if move_speed == "SIDEWAYS"
+        else derive_instrument_recommendation(move_speed, trend_direction)
+    )
+
+    volatility_expanded = atr_expansion > 0.018 or volume_strength >= 1.8
+    warnings: list[str] = []
+    if theta_risk == "HIGH":
+        warnings.append("⚠️ ATM option buying risky due to time decay")
+    if volatility_expanded:
+        warnings.append("⚠️ Option premium may already be expensive")
+    if move_speed == "SIDEWAYS":
+        warnings.append("⚠️ Sideways setup can erode option premiums without directional follow-through")
+
+    return {
+        "symbol": symbol,
+        "signal_type": str(selected.get("signal_type", "UNKNOWN")),
+        "confidence": int(_safe_float(selected.get("confidence"), 0)),
+        "trend_direction": trend_direction,
+        "move_speed": move_speed,
+        "hold_bucket": hold_bucket,
+        "theta_risk": theta_risk,
+        "recommendation": recommendation,
+        "warnings": warnings,
+    }
+
+
+def render_derivative_stock_action(
+    row: pd.Series,
+    signal_type: str,
+    key: str,
+    label: str = "📈",
+    use_container_width: bool = True,
+) -> None:
+    if st.button(
+        label,
+        key=key,
+        help=f"Analyze {row.get('Stock', 'stock')} for F&O",
+        use_container_width=use_container_width,
+    ):
+        with get_db_connection() as conn:
+            init_db(conn)
+            inserted = insert_selected_fno_from_row(conn, row, signal_type)
+            conn.commit()
+        if inserted:
+            st.toast(f"{row.get('Stock', 'Stock')} added to F&O analysis", icon="📈")
+        else:
+            st.toast(f"{row.get('Stock', 'Stock')} is already in F&O analysis", icon="📈")
+        st.rerun()
+
+
+def _signal_row_colors(row: pd.Series) -> tuple[str, str, str]:
+    signal = str(row.get("Signal", "")).upper()
+    direction = signal_direction(signal)
+    strength = signal_strength(signal)
+    if direction == "LONG":
+        return (
+            "#d8f0dd" if strength == "STRONG" else "#f1fbf4",
+            "#14331d",
+            "#2d8a45",
+        )
+    if direction == "SHORT":
+        return (
+            "#f7d9d9" if strength == "STRONG" else "#fff5f5",
+            "#421111",
+            "#c62828",
+        )
+    return "#f7f7f8", "#2f3136", "#b8bcc4"
+
+
+def _render_signal_cell(
+    value: Any,
+    row: pd.Series,
+    column: str,
+    emphasized: bool = False,
+    position: str = "middle",
+) -> None:
+    bg, fg, border = _signal_row_colors(row)
+    weight = "800" if emphasized else "600"
+    text = html.escape(_format_trend_watch_cell(value, column))
+    radius = {
+        "first": "8px 0 0 8px",
+        "last": "0 8px 8px 0",
+        "only": "8px",
+    }.get(position, "0")
+    left_border = f"3px solid {border}" if position in {"first", "only"} else "0"
+    st.markdown(
+        f"""
+        <div style="
+            min-height: 42px;
+            padding: 8px 10px;
+            margin: 1px 0;
+            background: {bg};
+            color: {fg};
+            border-top: 1px solid rgba(31, 41, 55, 0.08);
+            border-bottom: 1px solid rgba(31, 41, 55, 0.08);
+            border-right: 1px solid rgba(31, 41, 55, 0.06);
+            border-left: {left_border};
+            border-radius: {radius};
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55);
+            font-weight: {weight};
+            font-size: 0.84rem;
+            line-height: 1.2;
+            overflow-wrap: anywhere;
+        ">{text}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_select_trade_action(row: pd.Series, key: str) -> None:
+    if not (
+        is_trade_signal(str(row.get("Signal", "")))
+        and str(row.get("trend_stage", "")).upper() != "EMERGING"
+    ):
+        st.write("")
+        return
+    if st.button("⭐", key=key, help=f"Select {row.get('Stock', 'stock')}", use_container_width=True):
+        with get_db_connection() as wconn:
+            init_db(wconn)
+            inserted = insert_selected_trade_from_row(wconn, row)
+            wconn.commit()
+        if inserted:
+            st.toast(f"{row['Stock']} added to selected trades", icon="⭐")
+        else:
+            st.toast("Already selected or invalid row", icon="ℹ️")
+        st.rerun()
+
+
+def render_why_trade_action(row: pd.Series, key_suffix: str) -> None:
+    _why_label = "ℹ️" + key_suffix
+    with st.popover(_why_label, help="Why this trade?"):
+        st.markdown("**Why this trade?**")
+        render_trade_explain_body(row)
+
+
+def _format_trend_watch_cell(value: Any, column: str) -> str:
+    if pd.isna(value):
+        return ""
+    if column in {"Entry", "Current Price", "Stop Loss", "Target", "RSI", "EMA20"}:
+        numeric = pd.to_numeric(value, errors="coerce")
+        if pd.notna(numeric):
+            return f"{float(numeric):.2f}"
+    if column in {"trend_age", "Confidence Score"}:
+        numeric = pd.to_numeric(value, errors="coerce")
+        if pd.notna(numeric):
+            return str(int(numeric))
+    return str(value)
+
+
+def render_trend_action_table(
+    data: pd.DataFrame,
+    table_cols: list[str],
+    signal_type: str,
+    key_prefix: str,
+    max_rows: int = 10,
+) -> None:
+    visible = data.head(max_rows).copy()
+    if visible.empty:
+        return
+
+    headers = table_cols + ["F&O"]
+    weights = [1.25, 1.2, 1.45, 1.05, 0.75, 1.7, 1.0, 0.75, 0.95, 0.45]
+    col_weights = weights[: len(headers)]
+
+    header_cols = st.columns(col_weights, gap="small")
+    for col, label in zip(header_cols, headers):
+        col.markdown(f"**{label}**")
+
+    for idx, (_, row) in enumerate(visible.iterrows()):
+        row_cols = st.columns(col_weights, gap=None, vertical_alignment="center")
+        for cell_idx, (col_obj, column_name) in enumerate(zip(row_cols[:-1], table_cols)):
+            with col_obj:
+                _render_signal_cell(
+                    row.get(column_name),
+                    row,
+                    column_name,
+                    emphasized=column_name in {"Stock", "Signal"},
+                    position=(
+                        "only"
+                        if len(table_cols) == 1
+                        else "first"
+                        if cell_idx == 0
+                        else "last"
+                        if cell_idx == len(table_cols) - 1
+                        else "middle"
+                    ),
+                )
+        with row_cols[-1]:
+            render_derivative_stock_action(
+                row=row,
+                signal_type=signal_type,
+                key=f"{key_prefix}_{idx}",
+            )
+
+    if len(data) > max_rows:
+        st.caption(f"Showing first {max_rows} of {len(data)} rows.")
+
+
+def render_colored_signal_table(data: pd.DataFrame, table_cols: list[str], max_rows: int = 10) -> None:
+    visible = data.head(max_rows).copy()
+    if visible.empty:
+        return
+
+    weights = [1.25, 1.2, 1.45, 1.05, 0.75, 1.7, 1.0, 0.75, 0.95]
+    col_weights = weights[: len(table_cols)]
+    header_cols = st.columns(col_weights, gap="small")
+    for col, label in zip(header_cols, table_cols):
+        col.markdown(f"**{label}**")
+
+    for _, row in visible.iterrows():
+        row_cols = st.columns(col_weights, gap=None, vertical_alignment="center")
+        for cell_idx, (col_obj, column_name) in enumerate(zip(row_cols, table_cols)):
+            with col_obj:
+                _render_signal_cell(
+                    row.get(column_name),
+                    row,
+                    column_name,
+                    emphasized=column_name in {"Stock", "Signal"},
+                    position=(
+                        "only"
+                        if len(table_cols) == 1
+                        else "first"
+                        if cell_idx == 0
+                        else "last"
+                        if cell_idx == len(table_cols) - 1
+                        else "middle"
+                    ),
+                )
+
+    if len(data) > max_rows:
+        st.caption(f"Showing first {max_rows} of {len(data)} rows.")
+
+
+def render_trade_action_table(data: pd.DataFrame, side: str) -> None:
+    if data.empty:
+        st.info("No long setups today" if side == "LONG" else "No short setups today")
+        return
+
+    table_cols = [
+        c
+        for c in (
+            "Stock",
+            "Signal",
+            "Entry",
+            "Current Price",
+            "Stop Loss",
+            "Target",
+            "RSI",
+            "Confidence Score",
+            "Trade Quality",
+        )
+        if c in data.columns
+    ]
+    headers = table_cols + ["Select", "Why", "F&O"]
+    weights = [1.35, 1.15, 0.9, 0.95, 0.9, 0.9, 0.65, 0.75, 1.0, 0.48, 0.42, 0.42]
+    col_weights = weights[: len(headers)]
+
+    header_cols = st.columns(col_weights, gap="small")
+    for col, label in zip(header_cols, headers):
+        col.markdown(f"**{label}**")
+
+    for idx, (_, row) in enumerate(data.iterrows()):
+        row_cols = st.columns(col_weights, gap=None, vertical_alignment="center")
+        for cell_idx, (col_obj, column_name) in enumerate(zip(row_cols[: len(table_cols)], table_cols)):
+            with col_obj:
+                _render_signal_cell(
+                    row.get(column_name),
+                    row,
+                    column_name,
+                    emphasized=column_name in {"Stock", "Signal"},
+                    position=(
+                        "only"
+                        if len(table_cols) == 1
+                        else "first"
+                        if cell_idx == 0
+                        else "last"
+                        if cell_idx == len(table_cols) - 1
+                        else "middle"
+                    ),
+                )
+
+        action_offset = len(table_cols)
+        with row_cols[action_offset]:
+            render_select_trade_action(row, key=f"select_trade_{side}_{idx}")
+        with row_cols[action_offset + 1]:
+            render_why_trade_action(row, key_suffix="\u200c" * (idx + 1))
+        with row_cols[action_offset + 2]:
+            if str(row.get("Signal", "")).upper() in {"STRONG_LONG", "STRONG_SHORT"}:
+                render_derivative_stock_action(
+                    row=row,
+                    signal_type=str(row.get("Signal", "UNKNOWN")),
+                    key=f"analyze_fno_{side}_{idx}",
+                )
+            else:
+                st.write("")
+
+
+def selected_fno_payload_from_db_row(db_row: sqlite3.Row, signals: pd.DataFrame) -> dict[str, Any]:
+    stock = str(db_row["stock"]).upper()
+    current_row = signals_row_for_stock(signals, stock)
+    signal_type = str(db_row["signal_type"] or "UNKNOWN")
+    if current_row is not None:
+        return derivative_selection_payload(current_row, str(current_row.get("Signal", signal_type)))
+    return {
+        "symbol": stock,
+        "signal_type": signal_type,
+        "confidence": 0,
+        "trend_strength": 0.0,
+        "signal_metadata": {"signal": signal_type, "current_price": 0.0},
+    }
+
+
+def render_selected_fno_main(signals: pd.DataFrame) -> None:
+    with get_db_connection() as conn:
+        init_db(conn)
+        selected = get_selected_fno_stocks(conn)
+    if not selected:
+        return
+
+    st.subheader("📈 SELECTED F&O WATCH")
+    headers = ["Stock", "Signal", "Current Price", "Move", "Hold", "Theta"]
+    weights = [1.2, 1.2, 0.95, 0.9, 0.9, 0.75]
+    header_cols = st.columns(weights, gap="small")
+    for col, label in zip(header_cols, headers):
+        col.markdown(f"**{label}**")
+    for db_row in selected:
+        payload = selected_fno_payload_from_db_row(db_row, signals)
+        analysis = run_derivative_analysis(payload, signals)
+        row = signals_row_for_stock(signals, analysis["symbol"])
+        row_for_color = row if row is not None else pd.Series({"Signal": payload.get("signal_type", "")})
+        values = [
+            analysis["symbol"],
+            str(payload.get("signal_metadata", {}).get("signal") or payload.get("signal_type", "")),
+            _safe_float(payload.get("signal_metadata", {}).get("current_price"), 0.0),
+            analysis["move_speed"],
+            analysis["hold_bucket"],
+            analysis["theta_risk"],
+        ]
+        row_cols = st.columns(weights, gap=None, vertical_alignment="center")
+        for idx, (col, value, column_name) in enumerate(zip(row_cols, values, headers)):
+            with col:
+                _render_signal_cell(
+                    value,
+                    row_for_color,
+                    "Current Price" if column_name == "Current Price" else column_name,
+                    emphasized=idx in {0, 1},
+                    position=(
+                        "first"
+                        if idx == 0
+                        else "last"
+                        if idx == len(headers) - 1
+                        else "middle"
+                    ),
+                )
+
+
+def render_derivative_analysis_tab(signals: pd.DataFrame) -> None:
+    st.subheader("📈 Futures & Options Analysis")
+    with get_db_connection() as conn:
+        init_db(conn)
+        selected_rows = get_selected_fno_stocks(conn)
+    if not selected_rows:
+        st.info("Select stocks from the main dashboard using the 📈 F&O button.")
+        return
+
+    st.caption("Persisted F&O watchlist. Values refresh from the latest scan when the page reloads.")
+    for idx, db_row in enumerate(selected_rows):
+        selected = selected_fno_payload_from_db_row(db_row, signals)
+        analysis = run_derivative_analysis(selected, signals)
+        st.markdown(f"#### {analysis['symbol']}")
+
+        c1, c2, c3, c4 = st.columns([1.4, 1, 1, 0.45])
+        c1.metric("Signal", f"{analysis['trend_direction']} · {analysis['signal_type']}")
+        c2.metric("Move", analysis["move_speed"])
+        c3.metric("Hold", analysis["hold_bucket"])
+        with c4:
+            if st.button("✕", key=f"remove_fno_{analysis['symbol']}_{idx}", help="Remove from F&O analysis"):
+                with get_db_connection() as conn:
+                    init_db(conn)
+                    delete_selected_fno_stock(conn, analysis["symbol"])
+                    conn.commit()
+                st.toast(f"{analysis['symbol']} removed from F&O analysis", icon="🗑️")
+                st.rerun()
+
+        inst_col, risk_col = st.columns(2)
+        with inst_col:
+            st.markdown("**Recommended Instrument**")
+            st.markdown(f"✅ **{analysis['recommendation']['best']}**")
+            st.markdown(f"⚠️ **{analysis['recommendation']['alternate']}**")
+            st.markdown(f"❌ **{analysis['recommendation']['avoid']}**")
+        with risk_col:
+            st.markdown("**Theta Risk**")
+            st.metric("Risk", analysis["theta_risk"])
+            if analysis["warnings"]:
+                for warning in analysis["warnings"]:
+                    st.warning(warning)
+            else:
+                st.success("No major derivative risk warnings detected.")
+        st.divider()
+
 def render_selected_trades_focus(signals: pd.DataFrame) -> None:
     st.subheader("⭐ SELECTED TRADES")
     with get_db_connection() as conn:
@@ -4184,7 +4895,7 @@ def render_selected_trades_focus(signals: pd.DataFrame) -> None:
         selected_rows = get_active_selected_trades(conn)
         if not selected_rows:
             st.caption(
-                "No stocks in your focus list. Expand **LONG TRADES** or **SHORT TRADES** and press **Select Trade** on a card."
+                "No stocks in your focus list. Expand **LONG TRADES** or **SHORT TRADES** and press **⭐** on a row."
             )
             return
         for sel in selected_rows:
@@ -4316,7 +5027,7 @@ def render_trade_cards(data: pd.DataFrame, side: str) -> None:
             quality = str(row.get("Trade Quality", "—") or "—")
 
             with column:
-                card_col, why_col = st.columns([5.2, 1], gap="small")
+                card_col, fno_col, why_col = st.columns([5.2, 0.8, 0.8], gap="small")
                 with card_col:
                     st.markdown(
                         f"""
@@ -4331,6 +5042,14 @@ def render_trade_cards(data: pd.DataFrame, side: str) -> None:
                         """,
                         unsafe_allow_html=True,
                     )
+                with fno_col:
+                    if str(row.get("Signal", "")).upper() in {"STRONG_LONG", "STRONG_SHORT"}:
+                        render_derivative_stock_action(
+                            row=row,
+                            signal_type=str(row.get("Signal", "UNKNOWN")),
+                            key=f"analyze_fno_{side}_{start}_{pos}",
+                            use_container_width=True,
+                        )
                 with why_col:
                     # Streamlit 1.34 popover has no `key=`; unique invisible suffix avoids duplicate widget ids.
                     _why_label = "ℹ️" + ("\u200c" * (start * 10 + pos + 1))
@@ -4373,31 +5092,19 @@ def render_trade_section(
     ].copy() if not option_trades.empty and side.upper() in {"LONG", "SHORT"} else option_trades
 
     trade_count = len(futures_trades)
-    preview_count = 3
-    show_all_key = f"show_{side.lower()}_all"
-    show_all = bool(st.session_state.get(show_all_key, False))
-    visible_trades = futures_trades if show_all else futures_trades.head(preview_count)
 
     with st.expander(f"{title} ({trade_count})", expanded=False):
-        if visible_trades.empty:
+        if futures_trades.empty:
             st.info("No trades available in this section.")
             return
 
-        render_trade_cards(visible_trades, side)
-
-        if trade_count > preview_count and not show_all:
-            if st.button("Show More", key=f"{show_all_key}_btn"):
-                st.session_state[show_all_key] = True
-                st.rerun()
-        elif trade_count > preview_count and show_all:
-            if st.button("Show Less", key=f"{show_all_key}_less_btn"):
-                st.session_state[show_all_key] = False
-                st.rerun()
+        render_trade_action_table(futures_trades, side)
 
         with st.expander("Details", expanded=False):
-            st.dataframe(format_futures_table(visible_trades), use_container_width=True, hide_index=True)
             if not option_trades.empty:
                 st.dataframe(format_options_table(option_trades), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No matching option rows available.")
 
 
 def render_active_trades(active_history: pd.DataFrame, signals: pd.DataFrame) -> None:
@@ -4623,6 +5330,22 @@ def render_scan_status(signals: pd.DataFrame, errors: list[str]) -> None:
         st.dataframe(format_futures_table(signals), use_container_width=True, hide_index=True)
 
 
+def render_runtime_log_tail(lines: int = 80) -> None:
+    with st.expander("Runtime logs (latest)", expanded=False):
+        try:
+            if not LOG_PATH.exists():
+                st.caption("No runtime log file yet.")
+                return
+            content = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+            tail = content[-max(1, int(lines)) :]
+            if not tail:
+                st.caption("Log file is empty.")
+                return
+            st.code("\n".join(tail), language="text")
+        except Exception as exc:
+            st.caption(f"Unable to read runtime logs: {exc}")
+
+
 def render_trend_watch_sections(signals: pd.DataFrame) -> None:
     """Emerging / confirming / strong trend ladder — watchlist only; does not change Signal or filters."""
     st.subheader("Trend watchlist")
@@ -4655,14 +5378,19 @@ def render_trend_watch_sections(signals: pd.DataFrame) -> None:
     if em.empty:
         st.caption("None right now.")
     else:
-        st.dataframe(em[table_cols], use_container_width=True, hide_index=True)
+        render_colored_signal_table(em, table_cols)
 
     st.markdown("#### 🟠 Confirming Trends")
     cf = signals[signals["trend_stage"].astype(str).str.upper() == "CONFIRMING"].copy()
     if cf.empty:
         st.caption("None right now.")
     else:
-        st.dataframe(cf[table_cols], use_container_width=True, hide_index=True)
+        render_trend_action_table(
+            data=cf,
+            table_cols=table_cols,
+            signal_type="TRENDING",
+            key_prefix="analyze_fno_trending_confirming",
+        )
 
     st.markdown("#### 🟢 Strong Trades (trend ladder)")
     sg = signals[signals["trend_stage"].astype(str).str.upper() == "STRONG"].copy()
@@ -4670,7 +5398,12 @@ def render_trend_watch_sections(signals: pd.DataFrame) -> None:
         st.caption("None right now.")
     else:
         st.caption("Trend-stage STRONG (EMA separation + RSI + volume); not the same as STRONG_LONG / STRONG_SHORT alone.")
-        st.dataframe(sg[table_cols], use_container_width=True, hide_index=True)
+        render_trend_action_table(
+            data=sg,
+            table_cols=table_cols,
+            signal_type="TRENDING",
+            key_prefix="analyze_fno_trending_strong",
+        )
 
 
 def main() -> None:
@@ -4753,26 +5486,34 @@ def main() -> None:
     logger.info("LONG signals: %s", len(long_trades))
     logger.info("SHORT signals: %s", len(short_trades))
 
-    render_selected_trades_focus(signals)
-    render_top_trade_highlight(signals)
-    render_market_regime(regime, signals, last_updated)
-    render_scan_status(signals, errors)
-    render_trend_watch_sections(signals)
-    render_trade_section("🟢 LONG TRADES", long_trades, long_options, "LONG")
-    render_trade_section("🔴 SHORT TRADES", short_trades, short_options, "SHORT")
-    render_active_trades(active_history, signals)
-    render_exit_signals(closed_history)
-    render_closed_trades(closed_history)
+    main_tab, derivative_tab = st.tabs(["📊 Main Dashboard", "📈 Futures & Options Analysis"])
 
-    with st.expander(f"⏸️ No Trade ({len(wait_trades)})", expanded=False):
-        st.dataframe(format_futures_table(wait_trades.head(15)), use_container_width=True, hide_index=True)
+    with main_tab:
+        render_selected_trades_focus(signals)
+        render_selected_fno_main(signals)
+        render_top_trade_highlight(signals)
+        render_market_regime(regime, signals, last_updated)
+        render_scan_status(signals, errors)
+        render_trend_watch_sections(signals)
+        render_trade_section("🟢 LONG TRADES", long_trades, long_options, "LONG")
+        render_trade_section("🔴 SHORT TRADES", short_trades, short_options, "SHORT")
+        render_active_trades(active_history, signals)
+        render_exit_signals(closed_history)
+        render_closed_trades(closed_history)
 
-    render_performance_dashboard(performance_metrics)
+        with st.expander(f"⏸️ No Trade ({len(wait_trades)})", expanded=False):
+            st.dataframe(format_futures_table(wait_trades.head(15)), use_container_width=True, hide_index=True)
 
-    if errors:
-        with st.expander(f"Skipped Symbols / Errors ({len(errors)})"):
-            for error in errors[:250]:
-                st.write(error)
+        render_performance_dashboard(performance_metrics)
+
+        if errors:
+            with st.expander(f"Skipped Symbols / Errors ({len(errors)})"):
+                for error in errors[:250]:
+                    st.write(error)
+        render_runtime_log_tail(100)
+
+    with derivative_tab:
+        render_derivative_analysis_tab(signals)
 
 
 if __name__ == "__main__":
