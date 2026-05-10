@@ -5,7 +5,6 @@ import secrets
 import sqlite3
 from datetime import datetime
 import time
-from pathlib import Path
 
 import streamlit as st
 
@@ -43,11 +42,9 @@ from ui_components import (
 )
 
 
-AUTH_DB_PATH = Path("/Users/abhishektripathi/Documents/New project/signals.db")
-
-
 def _ensure_auth_table() -> None:
-    with sqlite3.connect(AUTH_DB_PATH) as conn:
+    with get_db_connection() as conn:
+        init_db(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS app_auth_sessions (
@@ -62,7 +59,8 @@ def _ensure_auth_table() -> None:
 
 
 def _save_auth_session(token: str, created_at: int, expires_at: int) -> None:
-    with sqlite3.connect(AUTH_DB_PATH) as conn:
+    with get_db_connection() as conn:
+        init_db(conn)
         conn.execute("DELETE FROM app_auth_sessions WHERE expires_at <= ?", (created_at,))
         conn.execute(
             """
@@ -77,7 +75,8 @@ def _save_auth_session(token: str, created_at: int, expires_at: int) -> None:
 def _is_auth_token_valid(token: str, now_ts: int) -> bool:
     if not token:
         return False
-    with sqlite3.connect(AUTH_DB_PATH) as conn:
+    with get_db_connection() as conn:
+        init_db(conn)
         row = conn.execute(
             "SELECT expires_at FROM app_auth_sessions WHERE token = ?",
             (str(token),),
@@ -90,7 +89,8 @@ def _is_auth_token_valid(token: str, now_ts: int) -> bool:
 def _delete_auth_session(token: str) -> None:
     if not token:
         return
-    with sqlite3.connect(AUTH_DB_PATH) as conn:
+    with get_db_connection() as conn:
+        init_db(conn)
         conn.execute("DELETE FROM app_auth_sessions WHERE token = ?", (str(token),))
         conn.commit()
 

@@ -34,8 +34,23 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 FNO_LIST_PATH = DATA_DIR / "fno_list.csv"
 OPTIONS_LIST_PATH = DATA_DIR / "options_list.csv"
-SIGNALS_DB_PATH = APP_DIR / "signals.db"
-LOG_DIR = APP_DIR / "logs"
+def _pick_runtime_dir() -> Path:
+    preferred = APP_DIR
+    try:
+        preferred.mkdir(parents=True, exist_ok=True)
+        probe = preferred / ".write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return preferred
+    except Exception:
+        fallback = Path("/tmp/chadankyatrades")
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+RUNTIME_DIR = _pick_runtime_dir()
+SIGNALS_DB_PATH = RUNTIME_DIR / "signals.db"
+LOG_DIR = RUNTIME_DIR / "logs"
 LOG_PATH = LOG_DIR / "trading_dashboard.log"
 _TRADING_LOG_BOOTSTRAPPED = False
 
