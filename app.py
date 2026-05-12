@@ -22,11 +22,7 @@ from db import (
     refresh_performance_metrics,
     update_signals,
 )
-from dashboard_core import (
-    FNO_FORCE_REFRESH_KEY,
-    FULL_SCAN_CACHE_KEY,
-    get_fno_selected_snapshot,
-)
+import dashboard_core as _dashboard_core
 from strategy import apply_position_sizing, build_options_plan, get_market_regime, ranked_trades, scan_symbols, sort_futures_table
 from ui_components import (
     format_futures_table,
@@ -46,6 +42,10 @@ from ui_components import (
     render_trade_section,
     render_trend_watch_sections,
 )
+
+FULL_SCAN_CACHE_KEY = str(getattr(_dashboard_core, "FULL_SCAN_CACHE_KEY", "full_scan_cache"))
+FNO_FORCE_REFRESH_KEY = str(getattr(_dashboard_core, "FNO_FORCE_REFRESH_KEY", "_fno_force_refresh_next"))
+_get_fno_selected_snapshot = getattr(_dashboard_core, "get_fno_selected_snapshot", None)
 
 
 def _ensure_auth_table() -> None:
@@ -313,15 +313,24 @@ def main() -> None:
             st.caption("Fetches latest data only for selected F&O stocks (no full-universe rescan).")
 
         force_fno = bool(st.session_state.pop(FNO_FORCE_REFRESH_KEY, False))
-        fno_signals, fno_status = get_fno_selected_snapshot(
-            selected_symbols=selected_symbols,
-            config=config,
-            market_regime=regime,
-            use_sample_data=use_sample_data,
-            period=period,
-            interval=interval,
-            force_refresh=force_fno,
-        )
+        if callable(_get_fno_selected_snapshot):
+            fno_signals, fno_status = _get_fno_selected_snapshot(
+                selected_symbols=selected_symbols,
+                config=config,
+                market_regime=regime,
+                use_sample_data=use_sample_data,
+                period=period,
+                interval=interval,
+                force_refresh=force_fno,
+            )
+        else:
+            fno_signals, fno_status = signals, {
+                "source": "FULL_SCAN_FALLBACK",
+                "last_refresh_epoch": time.time(),
+                "ttl_seconds": 60,
+                "next_refresh_in_sec": 0,
+                "quota_low": False,
+            }
         render_derivative_analysis_tab(signals, regime, fno_signals=fno_signals, fno_status=fno_status)
 
 
