@@ -15,11 +15,17 @@ from db import (
     default_performance_metrics,
     get_active_trades,
     get_db_connection,
+    get_selected_fno_stocks,
     get_trade_history,
     init_db,
     process_exits,
     refresh_performance_metrics,
     update_signals,
+)
+from dashboard_core import (
+    FNO_FORCE_REFRESH_KEY,
+    FULL_SCAN_CACHE_KEY,
+    get_fno_selected_snapshot,
 )
 from strategy import apply_position_sizing, build_options_plan, get_market_regime, ranked_trades, scan_symbols, sort_futures_table
 from ui_components import (
@@ -217,6 +223,11 @@ def main() -> None:
             use_sample_data=use_sample_data,
             market_refresh_nonce=int(st.session_state.get(MARKET_SCAN_NONCE_KEY, 0)),
         )
+    st.session_state[FULL_SCAN_CACHE_KEY] = {
+        "timestamp": time.time(),
+        "signals": signals.copy(),
+        "errors": list(errors),
+    }
 
     _ensure_market_cache_after_scan(symbols, period, interval, use_sample_data)
     render_market_data_cache_status_bar(symbols, period, interval, use_sample_data)
@@ -287,7 +298,31 @@ def main() -> None:
         render_runtime_log_tail(100)
 
     with derivative_tab:
-        render_derivative_analysis_tab(signals, regime)
+        selected_symbols: list[str] = []
+        with get_db_connection() as conn:
+            init_db(conn)
+            selected_rows = get_selected_fno_stocks(conn)
+            selected_symbols = [str(r["stock"]).upper() for r in selected_rows]
+
+        c_btn, c_status = st.columns([0.24, 0.76])
+        with c_btn:
+            if st.button("Refresh F&O Only", use_container_width=True):
+                st.session_state[FNO_FORCE_REFRESH_KEY] = True
+                st.rerun()
+        with c_status:
+            st.caption("Fetches latest data only for selected F&O stocks (no full-universe rescan).")
+
+        force_fno = bool(st.session_state.pop(FNO_FORCE_REFRESH_KEY, False))
+        fno_signals, fno_status = get_fno_selected_snapshot(
+            selected_symbols=selected_symbols,
+            config=config,
+            market_regime=regime,
+            use_sample_data=use_sample_data,
+            period=period,
+            interval=interval,
+            force_refresh=force_fno,
+        )
+        render_derivative_analysis_tab(signals, regime, fno_signals=fno_signals, fno_status=fno_status)
 
 
 if __name__ == "__main__":

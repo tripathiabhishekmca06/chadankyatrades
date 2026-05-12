@@ -212,6 +212,10 @@ MARKET_FORCE_NEXT_KEY = "_market_force_refresh_next"
 MARKET_FETCH_META_KEY = "_market_fetch_meta"
 MARKET_QUOTA_FLAG_KEY = "_market_quota_low_flag"
 MARKET_SCAN_NONCE_KEY = "_market_scan_refresh_nonce"
+FULL_SCAN_CACHE_KEY = "full_scan_cache"
+FNO_SELECTED_CACHE_KEY = "fno_selected_cache"
+FNO_FORCE_REFRESH_KEY = "_fno_force_refresh_next"
+FNO_SELECTED_CACHE_TTL_SECONDS = 60
 # Persists last successful LIVE market fetch time across browser sessions (for timer + skipping redundant API).
 MARKET_API_META_PATH = DATA_DIR / "market_api_meta.json"
 # Last merged OHLCV snapshot from a LIVE get_market_data run (same TTL as MARKET_SESSION_CACHE_TTL).
@@ -4485,6 +4489,132 @@ def scan_symbols(
     return sort_futures_table(pd.DataFrame(rows)), errors
 
 
+def scan_selected_symbols_only(
+    symbols: list[str],
+    config: StrategyConfig,
+    market_regime: dict[str, str],
+    period: str = "30d",
+    interval: str = "1h",
+    use_sample_data: bool = False,
+) -> tuple[pd.DataFrame, list[str]]:
+    if not symbols:
+        return empty_futures_table(), []
+
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    market_data = pd.DataFrame()
+    if not use_sample_data:
+        try:
+            market_data = download_market_data(tuple(symbols), period, interval)
+        except Exception as exc:
+            return empty_futures_table(), [f"Market data download failed: {exc}"]
+
+    for symbol in symbols:
+        try:
+            history = (
+                make_sample_history(symbol)
+                if use_sample_data
+                else extract_symbol_history(market_data, symbol, len(symbols))
+            )
+            if history.empty:
+                continue
+            row = analyze_stock(symbol, history, config, market_regime)
+            if row is not None:
+                rows.append(row)
+        except Exception as exc:
+            errors.append(f"{symbol}: {exc}")
+    if not rows:
+        return empty_futures_table(), errors
+    return sort_futures_table(pd.DataFrame(rows)), errors
+
+
+def get_fno_selected_snapshot(
+    selected_symbols: list[str],
+    config: StrategyConfig,
+    market_regime: dict[str, str],
+    use_sample_data: bool = False,
+    period: str = "30d",
+    interval: str = "1h",
+    force_refresh: bool = False,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    now = time.time()
+    key_symbols = tuple(sorted(str(s).upper() for s in selected_symbols if str(s).strip()))
+    cache_obj = st.session_state.get(FNO_SELECTED_CACHE_KEY, {})
+    cached_symbols = tuple(cache_obj.get("symbols", ()))
+    cached_ts = float(cache_obj.get("timestamp", 0.0) or 0.0)
+    cached_df = cache_obj.get("signals")
+    cache_age = max(0.0, now - cached_ts) if cached_ts > 0 else np.inf
+
+    usage = compute_api_usage_display()
+    quota_low = (
+        int(usage.get("alpha_minute_remaining", 99)) <= 1
+        or int(usage.get("eodhd_minute_remaining", 99)) <= 1
+    )
+
+    if (
+        not force_refresh
+        and key_symbols == cached_symbols
+        and isinstance(cached_df, pd.DataFrame)
+        and not cached_df.empty
+        and cache_age < float(FNO_SELECTED_CACHE_TTL_SECONDS)
+    ):
+        return cached_df.copy(), {
+            "source": "CACHE",
+            "last_refresh_epoch": cached_ts,
+            "ttl_seconds": FNO_SELECTED_CACHE_TTL_SECONDS,
+            "next_refresh_in_sec": max(0, int(FNO_SELECTED_CACHE_TTL_SECONDS - cache_age)),
+            "quota_low": quota_low,
+        }
+
+    if quota_low and isinstance(cached_df, pd.DataFrame) and not cached_df.empty and key_symbols == cached_symbols:
+        return cached_df.copy(), {
+            "source": "CACHE_QUOTA",
+            "last_refresh_epoch": cached_ts,
+            "ttl_seconds": FNO_SELECTED_CACHE_TTL_SECONDS,
+            "next_refresh_in_sec": max(0, int(FNO_SELECTED_CACHE_TTL_SECONDS - cache_age)),
+            "quota_low": True,
+        }
+
+    live_df, _errors = scan_selected_symbols_only(
+        symbols=list(key_symbols),
+        config=config,
+        market_regime=market_regime,
+        period=period,
+        interval=interval,
+        use_sample_data=use_sample_data,
+    )
+    if isinstance(live_df, pd.DataFrame) and not live_df.empty:
+        st.session_state[FNO_SELECTED_CACHE_KEY] = {
+            "symbols": key_symbols,
+            "timestamp": now,
+            "signals": live_df.copy(),
+        }
+        return live_df.copy(), {
+            "source": "LIVE",
+            "last_refresh_epoch": now,
+            "ttl_seconds": FNO_SELECTED_CACHE_TTL_SECONDS,
+            "next_refresh_in_sec": int(FNO_SELECTED_CACHE_TTL_SECONDS),
+            "quota_low": quota_low,
+        }
+
+    if isinstance(cached_df, pd.DataFrame) and not cached_df.empty and key_symbols == cached_symbols:
+        return cached_df.copy(), {
+            "source": "CACHE_FALLBACK",
+            "last_refresh_epoch": cached_ts,
+            "ttl_seconds": FNO_SELECTED_CACHE_TTL_SECONDS,
+            "next_refresh_in_sec": max(0, int(FNO_SELECTED_CACHE_TTL_SECONDS - cache_age)),
+            "quota_low": quota_low,
+        }
+
+    return empty_futures_table(), {
+        "source": "EMPTY",
+        "last_refresh_epoch": 0.0,
+        "ttl_seconds": FNO_SELECTED_CACHE_TTL_SECONDS,
+        "next_refresh_in_sec": 0,
+        "quota_low": quota_low,
+    }
+
+
 def ranked_trades(signals: pd.DataFrame, allowed_signals: set[str], limit: int | None = None) -> pd.DataFrame:
     if signals.empty:
         return empty_futures_table()
@@ -6220,7 +6350,12 @@ def render_selected_fno_main(signals: pd.DataFrame) -> None:
                 )
 
 
-def render_derivative_analysis_tab(signals: pd.DataFrame, market_regime: dict[str, Any] | None = None) -> None:
+def render_derivative_analysis_tab(
+    signals: pd.DataFrame,
+    market_regime: dict[str, Any] | None = None,
+    fno_signals: pd.DataFrame | None = None,
+    fno_status: dict[str, Any] | None = None,
+) -> None:
     st.subheader("📈 Futures & Options Analysis")
     with get_db_connection() as conn:
         init_db(conn)
@@ -6229,11 +6364,23 @@ def render_derivative_analysis_tab(signals: pd.DataFrame, market_regime: dict[st
         st.info("Select stocks from the main dashboard using the 📈 F&O button.")
         return
 
-    st.caption("Persisted F&O watchlist. Values refresh from the latest scan when the page reloads.")
-    confirmation_by_symbol = fetch_fno_15m_confirmations([str(row["stock"]) for row in selected_rows], signals)
+    fno_view = fno_signals if isinstance(fno_signals, pd.DataFrame) else signals
+    st.caption("Persisted F&O watchlist. Values refresh from selected-stock cache/live snapshot.")
+    if fno_status:
+        last_epoch = float(fno_status.get("last_refresh_epoch", 0.0) or 0.0)
+        last_txt = datetime.fromtimestamp(last_epoch).strftime("%d %b %Y, %H:%M:%S") if last_epoch > 0 else "—"
+        source_txt = str(fno_status.get("source", "UNKNOWN"))
+        next_in = int(fno_status.get("next_refresh_in_sec", 0) or 0)
+        s1, s2, s3 = st.columns(3)
+        s1.caption(f"F&O last refresh: {last_txt}")
+        s2.caption(f"F&O source: {source_txt}")
+        s3.caption(f"Next refresh available in: {max(0, next_in)} sec")
+        if bool(fno_status.get("quota_low")):
+            st.info("API quota is low. Showing cached F&O data.")
+    confirmation_by_symbol = fetch_fno_15m_confirmations([str(row["stock"]) for row in selected_rows], fno_view)
     for idx, db_row in enumerate(selected_rows):
-        selected = selected_fno_payload_from_db_row(db_row, signals)
-        analysis = run_derivative_analysis(selected, signals)
+        selected = selected_fno_payload_from_db_row(db_row, fno_view)
+        analysis = run_derivative_analysis(selected, fno_view)
         timing = confirmation_by_symbol.get(analysis["symbol"], {})
         st.markdown(f"#### {analysis['symbol']}")
 
