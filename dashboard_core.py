@@ -101,6 +101,12 @@ FUTURES_COLUMNS = [
     "trend_stage",
     "trend_age",
     "trend_watch_note",
+    "Early RS Label",
+    "Relative Strength Score",
+    "Pre Event Label",
+    "Post Event Label",
+    "Event Strength Score",
+    "Event Warning",
     "Risk ₹",
     "Suggested Qty",
     "Suggested Lots",
@@ -178,6 +184,7 @@ SIGNAL_PRIORITY = {
     "EARLY_SHORT": 2,
     "WEAK_LONG": 3,
     "WEAK_SHORT": 3,
+    "EARLY_RS_LONG": 3,
     "WAIT": 4,
 }
 
@@ -1574,6 +1581,16 @@ def get_market_data_with_cache(
         MARKET_SESSION_CACHE_TTL,
     )
 
+    def _write_meta(source: str, age_seconds: float) -> None:
+        try:
+            st.session_state[MARKET_FETCH_META_KEY] = {
+                "source": source,
+                "age_seconds": float(age_seconds),
+                "ts": now,
+            }
+        except Exception:
+            pass
+
     # Reload last LIVE snapshot from disk (new browser session / refresh) — no Alpha/EODHD
     # until TTL expires or user forces refresh.
     if not force_refresh:
@@ -1611,16 +1628,6 @@ def get_market_data_with_cache(
                 )
     except Exception:
         pass
-
-    def _write_meta(source: str, age_seconds: float) -> None:
-        try:
-            st.session_state[MARKET_FETCH_META_KEY] = {
-                "source": source,
-                "age_seconds": float(age_seconds),
-                "ts": now,
-            }
-        except Exception:
-            pass
 
     cached_data = cache.get("data")
     cached_ts = float(cache.get("timestamp") or 0.0)
@@ -2717,6 +2724,8 @@ def default_market_regime(error: str = "") -> dict[str, str]:
         "banknifty_trend": "UNKNOWN",
         "adx": "",
         "rsi": "",
+        "nifty_return_pct": "-",
+        "market_drawdown_pct": "-",
         "error": error,
     }
 
@@ -2780,10 +2789,14 @@ def get_market_regime() -> dict[str, str]:
         adx = np.nan
         rsi = np.nan
         banknifty_trend = "UNKNOWN"
+        nifty_return_pct = np.nan
+        market_drawdown_pct = np.nan
 
         niftybees_data = _fetch_regime_history("NIFTYBEES.NS")
         if not niftybees_data.empty:
             nifty_trend, adx, rsi = classify_index_trend(niftybees_data, config)
+            nifty_return_pct = _window_return_pct(niftybees_data["Close"], lookback=20)
+            market_drawdown_pct = _window_drawdown_pct(niftybees_data["Close"], lookback=20)
             source = "NIFTYBEES"
             print("Market regime source: NIFTYBEES")
         else:
@@ -2851,6 +2864,8 @@ def get_market_regime() -> dict[str, str]:
             "banknifty_trend": banknifty_trend,
             "adx": f"{adx:.1f}" if np.isfinite(adx) else "-",
             "rsi": f"{rsi:.1f}" if np.isfinite(rsi) else "-",
+            "nifty_return_pct": f"{nifty_return_pct:.2f}" if np.isfinite(nifty_return_pct) else "-",
+            "market_drawdown_pct": f"{market_drawdown_pct:.2f}" if np.isfinite(market_drawdown_pct) else "-",
             "error": "",
         }
     except Exception as exc:
@@ -2905,6 +2920,65 @@ def pnl_pct(direction: str, entry_price: float, current_price: float) -> float:
         return (current_price - entry_price) / entry_price * 100
     if direction == "SHORT":
         return (entry_price - current_price) / entry_price * 100
+    return np.nan
+
+
+def _window_return_pct(series: pd.Series, lookback: int = 20) -> float:
+    if series is None or len(series) < 2:
+        return np.nan
+    end_val = pd.to_numeric(series.iloc[-1], errors="coerce")
+    start_idx = max(0, len(series) - 1 - max(1, int(lookback)))
+    start_val = pd.to_numeric(series.iloc[start_idx], errors="coerce")
+    if pd.isna(start_val) or pd.isna(end_val) or float(start_val) == 0.0:
+        return np.nan
+    return (float(end_val) - float(start_val)) / float(start_val) * 100.0
+
+
+def _window_drawdown_pct(series: pd.Series, lookback: int = 20) -> float:
+    if series is None or len(series) < 2:
+        return np.nan
+    window = pd.to_numeric(series.tail(max(2, int(lookback))), errors="coerce").dropna()
+    if window.empty:
+        return np.nan
+    peak = float(window.max())
+    last = float(window.iloc[-1])
+    if peak <= 0:
+        return np.nan
+    return (peak - last) / peak * 100.0
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def _days_to_next_event(symbol: str) -> float:
+    try:
+        ticker = yf.Ticker(symbol)
+        calendar = getattr(ticker, "calendar", None)
+        if calendar is None or len(calendar) == 0:
+            return np.nan
+        if isinstance(calendar, pd.DataFrame):
+            values: list[Any] = []
+            if "Earnings Date" in calendar.index:
+                values = list(np.ravel(calendar.loc["Earnings Date"].values))
+            elif "Earnings Date" in calendar.columns:
+                values = list(np.ravel(calendar["Earnings Date"].values))
+            else:
+                values = list(np.ravel(calendar.values))
+            for value in values:
+                ts = pd.to_datetime(value, errors="coerce")
+                if pd.notna(ts):
+                    delta = (ts.date() - datetime.now().date()).days
+                    return float(delta)
+        if isinstance(calendar, dict):
+            for key in ("Earnings Date", "earningsDate", "earnings_date"):
+                if key in calendar:
+                    raw = calendar.get(key)
+                    if isinstance(raw, (list, tuple)) and raw:
+                        raw = raw[0]
+                    ts = pd.to_datetime(raw, errors="coerce")
+                    if pd.notna(ts):
+                        delta = (ts.date() - datetime.now().date()).days
+                        return float(delta)
+    except Exception:
+        return np.nan
     return np.nan
 
 
@@ -4054,6 +4128,8 @@ def evaluate_symbol(
     avg_volume = float(latest["Avg Volume"])
     distance_from_ema20 = abs(close - ema20) / ema20
     trend_strength = abs(ema20 - ema50) / ema50
+    stock_return_pct = _window_return_pct(data["Close"], lookback=20)
+    stock_drawdown_pct = _window_drawdown_pct(data["Close"], lookback=20)
 
     market_type = (market_regime or {}).get("market_type", "UNKNOWN")
     signal_type, entry = classify_setup(
@@ -4162,6 +4238,77 @@ def evaluate_symbol(
 
     tw = compute_trend_watch_state(data)
 
+    market_return_pct = pd.to_numeric((market_regime or {}).get("nifty_return_pct"), errors="coerce")
+    market_drawdown_pct = pd.to_numeric((market_regime or {}).get("market_drawdown_pct"), errors="coerce")
+    market_type_upper = str((market_regime or {}).get("market_type", "UNKNOWN")).upper()
+    trend_confirmation_upper = str((market_regime or {}).get("trend_confirmation", "WEAK")).upper()
+    bearish_or_weak_market = market_type_upper in {"TRENDING_BEARISH", "SIDEWAYS", "NEUTRAL", "UNKNOWN"} or trend_confirmation_upper == "WEAK"
+    rs_outperformance = (
+        float(stock_return_pct - market_return_pct)
+        if pd.notna(stock_return_pct) and pd.notna(market_return_pct)
+        else np.nan
+    )
+    smaller_drawdown = (
+        bool(pd.notna(stock_drawdown_pct) and pd.notna(market_drawdown_pct) and float(stock_drawdown_pct) < float(market_drawdown_pct))
+    )
+    recent_slice = data.tail(6)
+    recent_breakdown = bool((recent_slice["Close"] < recent_slice["EMA20"]).any()) if not recent_slice.empty else True
+    early_rs_long = (
+        bearish_or_weak_market
+        and close > ema20
+        and pd.notna(rs_outperformance)
+        and float(rs_outperformance) > 1.0
+        and rsi > 55.0
+        and smaller_drawdown
+        and not recent_breakdown
+    )
+    relative_strength_score = 0.0
+    if pd.notna(rs_outperformance):
+        relative_strength_score += min(4.0, max(0.0, float(rs_outperformance)))
+    if rsi > 55.0:
+        relative_strength_score += min(2.0, (rsi - 55.0) / 5.0)
+    if smaller_drawdown:
+        relative_strength_score += 2.0
+    if close > ema20:
+        relative_strength_score += 1.0
+    if not recent_breakdown:
+        relative_strength_score += 1.0
+
+    days_to_event = _days_to_next_event(symbol)
+    event_within_7_days = bool(pd.notna(days_to_event) and 0 <= float(days_to_event) <= 7)
+    rsi_strengthening = bool(len(data) >= 4 and float(data["RSI"].iloc[-1]) > float(data["RSI"].iloc[-4]))
+    pre_event_accumulation = (
+        event_within_7_days
+        and pd.notna(rs_outperformance)
+        and float(rs_outperformance) > 0.0
+        and close > ema20 > ema50
+        and rsi_strengthening
+        and smaller_drawdown
+    )
+    prev_close = pd.to_numeric(data["Close"].iloc[-2], errors="coerce") if len(data) >= 2 else np.nan
+    gap_up_pct = (
+        (close - float(prev_close)) / float(prev_close) * 100.0
+        if pd.notna(prev_close) and float(prev_close) != 0.0
+        else np.nan
+    )
+    atr_spike_ratio = (atr_value / atr_median) if atr_median > 0 else np.nan
+    post_event_risk = (
+        pd.notna(gap_up_pct)
+        and float(gap_up_pct) > 5.0
+        and distance_from_ema20 > 0.035
+        and pd.notna(atr_spike_ratio)
+        and float(atr_spike_ratio) > 1.35
+    )
+    event_strength_score = 0.0
+    if pre_event_accumulation:
+        event_strength_score += 5.0
+    if pd.notna(rs_outperformance):
+        event_strength_score += min(3.0, max(0.0, float(rs_outperformance)))
+    if rsi_strengthening:
+        event_strength_score += 1.0
+    if smaller_drawdown:
+        event_strength_score += 1.0
+
     return {
         "Stock": symbol,
         "Signal": signal,
@@ -4200,6 +4347,12 @@ def evaluate_symbol(
         "trend_stage": tw["trend_stage"],
         "trend_age": tw["trend_age"],
         "trend_watch_note": tw["trend_watch_note"],
+        "Early RS Label": "EARLY_RS_LONG" if early_rs_long else "",
+        "Relative Strength Score": round(float(relative_strength_score), 2) if early_rs_long else np.nan,
+        "Pre Event Label": "PRE_EVENT_ACCUMULATION" if pre_event_accumulation else "",
+        "Post Event Label": "POST_EVENT_RISK" if post_event_risk else "",
+        "Event Strength Score": round(float(event_strength_score), 2) if pre_event_accumulation else np.nan,
+        "Event Warning": "Late entry risk elevated" if post_event_risk else "",
     }
 
 
@@ -5816,13 +5969,17 @@ def _render_signal_cell(
 
 
 def render_select_trade_action(row: pd.Series, key: str) -> None:
-    if not (
+    eligible = (
         is_trade_signal(str(row.get("Signal", "")))
         and str(row.get("trend_stage", "")).upper() != "EMERGING"
+    )
+    if st.button(
+        "⭐",
+        key=key,
+        help=f"Select {row.get('Stock', 'stock')}",
+        use_container_width=True,
+        disabled=not eligible,
     ):
-        st.write("")
-        return
-    if st.button("⭐", key=key, help=f"Select {row.get('Stock', 'stock')}", use_container_width=True):
         with get_db_connection() as wconn:
             init_db(wconn)
             inserted = insert_selected_trade_from_row(wconn, row)
@@ -5835,7 +5992,9 @@ def render_select_trade_action(row: pd.Series, key: str) -> None:
 
 
 def render_why_trade_action(row: pd.Series, key_suffix: str) -> None:
-    _why_label = "ℹ️" + key_suffix
+    # Streamlit popover does not expose key=; keep uniqueness via invisible suffix only.
+    invisible_suffix = "\u200b" * max(1, min(len(str(key_suffix)), 24))
+    _why_label = "ℹ️" + invisible_suffix
     with st.popover(_why_label, help="Why this trade?"):
         st.markdown("**Why this trade?**")
         render_trade_explain_body(row)
@@ -5948,28 +6107,20 @@ def render_trade_action_table(data: pd.DataFrame, side: str) -> None:
         st.info("No long setups today" if side == "LONG" else "No short setups today")
         return
 
-    table_cols = [
-        c
-        for c in (
-            "Stock",
-            "Signal",
-            "Entry",
-            "Current Price",
-            "Stop Loss",
-            "Target",
-            "RSI",
-            "Confidence Score",
-            "Trade Quality",
-            "Risk ₹",
-            "Suggested Qty",
-            "Suggested Lots",
-            "Reward ₹",
-            "Position Risk %",
-        )
-        if c in data.columns
+    base_cols = [
+        ("Stock", "Stock"),
+        ("Signal", "Signal"),
+        ("Entry", "Entry"),
+        ("Current", "Current Price"),
+        ("SL", "Stop Loss"),
+        ("Target", "Target"),
+        ("RSI", "RSI"),
+        ("Score", "Confidence Score"),
+        ("Quality", "Trade Quality"),
     ]
-    headers = table_cols + ["Select", "Why", "F&O"]
-    weights = [1.25, 1.05, 0.8, 0.85, 0.8, 0.8, 0.55, 0.65, 0.9, 0.75, 0.75, 0.75, 0.75, 0.75, 0.42, 0.38, 0.38]
+    present_base = [(label, col) for label, col in base_cols if col in data.columns]
+    headers = [label for label, _ in present_base] + ["Actions"]
+    weights = [1.35, 1.12, 0.82, 0.88, 0.82, 0.82, 0.58, 0.52, 0.72, 1.35]
     col_weights = weights[: len(headers)]
 
     header_cols = st.columns(col_weights, gap="small")
@@ -5977,39 +6128,37 @@ def render_trade_action_table(data: pd.DataFrame, side: str) -> None:
         col.markdown(f"**{label}**")
 
     for idx, (_, row) in enumerate(data.iterrows()):
-        row_cols = st.columns(col_weights, gap=None, vertical_alignment="center")
-        for cell_idx, (col_obj, column_name) in enumerate(zip(row_cols[: len(table_cols)], table_cols)):
+        row_cols = st.columns(col_weights, gap="small", vertical_alignment="center")
+        for cell_idx, (col_obj, (header_label, column_name)) in enumerate(zip(row_cols[:-1], present_base)):
             with col_obj:
                 _render_signal_cell(
                     row.get(column_name),
                     row,
                     column_name,
-                    emphasized=column_name in {"Stock", "Signal"},
+                    emphasized=header_label in {"Stock", "Signal"},
                     position=(
                         "only"
-                        if len(table_cols) == 1
+                        if len(present_base) == 1
                         else "first"
                         if cell_idx == 0
                         else "last"
-                        if cell_idx == len(table_cols) - 1
+                        if cell_idx == len(present_base) - 1
                         else "middle"
                     ),
                 )
-
-        action_offset = len(table_cols)
-        with row_cols[action_offset]:
-            render_select_trade_action(row, key=f"select_trade_{side}_{idx}")
-        with row_cols[action_offset + 1]:
-            render_why_trade_action(row, key_suffix="\u200c" * (idx + 1))
-        with row_cols[action_offset + 2]:
-            if str(row.get("Signal", "")).upper() in {"STRONG_LONG", "STRONG_SHORT"}:
+        with row_cols[-1]:
+            a1, a2, a3 = st.columns([1, 1, 1], gap="small")
+            stable_id = f"{side}_{idx}_{str(row.get('Stock', 'NA')).upper().replace('.', '_')}"
+            with a1:
+                render_select_trade_action(row, key=f"select_trade_{stable_id}")
+            with a2:
+                render_why_trade_action(row, key_suffix=stable_id)
+            with a3:
                 render_derivative_stock_action(
                     row=row,
                     signal_type=str(row.get("Signal", "UNKNOWN")),
-                    key=f"analyze_fno_{side}_{idx}",
+                    key=f"analyze_fno_{stable_id}",
                 )
-            else:
-                st.write("")
 
 
 def selected_fno_payload_from_db_row(db_row: sqlite3.Row, signals: pd.DataFrame) -> dict[str, Any]:
@@ -6821,6 +6970,51 @@ def render_trend_watch_sections(signals: pd.DataFrame) -> None:
             table_cols=table_cols,
             signal_type="TRENDING",
             key_prefix="analyze_fno_trending_strong",
+        )
+
+    st.markdown("#### 🟢 Early Relative Strength")
+    rs_cols = [c for c in ("Stock", "Signal", "Current Price", "RSI", "EMA20", "Relative Strength Score", "Reason") if c in signals.columns]
+    rs = signals[signals["Early RS Label"].astype(str).str.upper() == "EARLY_RS_LONG"].copy() if "Early RS Label" in signals.columns else pd.DataFrame()
+    if rs.empty:
+        st.caption("None right now.")
+    else:
+        rs["Signal"] = "EARLY_RS_LONG"
+        st.caption("Hidden strength watchlist during weak/bearish market. Watchlist-only; not auto-promoted to STRONG_LONG.")
+        render_trend_action_table(
+            data=rs.sort_values(by=["Relative Strength Score", "RSI"], ascending=[False, False]),
+            table_cols=rs_cols,
+            signal_type="EARLY_RS_LONG",
+            key_prefix="analyze_fno_early_rs",
+        )
+
+    st.markdown("#### 🟢 Pre-Event Strength")
+    pe_cols = [c for c in ("Stock", "Signal", "Current Price", "RSI", "EMA20", "EMA50", "Event Strength Score", "Reason") if c in signals.columns]
+    pe = signals[signals["Pre Event Label"].astype(str).str.upper() == "PRE_EVENT_ACCUMULATION"].copy() if "Pre Event Label" in signals.columns else pd.DataFrame()
+    if pe.empty:
+        st.caption("None right now.")
+    else:
+        pe["Signal"] = "PRE_EVENT_ACCUMULATION"
+        st.caption("Watchlist-only event accumulation candidates before potential breakout.")
+        render_trend_action_table(
+            data=pe.sort_values(by=["Event Strength Score", "RSI"], ascending=[False, False]),
+            table_cols=pe_cols,
+            signal_type="PRE_EVENT_ACCUMULATION",
+            key_prefix="analyze_fno_pre_event",
+        )
+
+    st.markdown("#### 🔴 Post-Event Risk")
+    po_cols = [c for c in ("Stock", "Signal", "Current Price", "Distance from EMA20 %", "ATR", "Event Warning") if c in signals.columns]
+    po = signals[signals["Post Event Label"].astype(str).str.upper() == "POST_EVENT_RISK"].copy() if "Post Event Label" in signals.columns else pd.DataFrame()
+    if po.empty:
+        st.caption("None right now.")
+    else:
+        po["Signal"] = "POST_EVENT_RISK"
+        po["Event Warning"] = "Late entry risk elevated"
+        render_trend_action_table(
+            data=po.sort_values(by=["Distance from EMA20 %", "ATR"], ascending=[False, False]),
+            table_cols=po_cols,
+            signal_type="POST_EVENT_RISK",
+            key_prefix="analyze_fno_post_event",
         )
 
 
